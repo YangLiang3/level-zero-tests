@@ -28,6 +28,10 @@
 #include <signal.h>
 #include <level_zero/ze_api.h>
 
+#ifndef ZE_PEER_ENABLE_MPI
+#define ZE_PEER_ENABLE_MPI 0
+#endif
+
 typedef enum _peer_transfer_t {
   PEER_WRITE = 0,
   PEER_READ,
@@ -57,6 +61,8 @@ static const char *usage_str =
     "\n"
     "\n OPTIONS:"
     "\n  -b                          run bidirectional mode. Default: Not set."
+    "\n                              For IPC paths, bidirectional is supported"
+    " only with --ipc-mpi."
     "\n  -c                          run continuously until hitting CTRL+C. "
     "Default: Not set."
     "\n  -i                          number of iterations to run. Default: 50."
@@ -96,6 +102,10 @@ static const char *usage_str =
     "\n                              all available engines with compute "
     "capability."
     "\n                              Extra options: -x"
+    "\n                              In --ipc-mpi mode, acts as topology"
+    " selector: one -s to one"
+    "\n                              -d device; parallel engine split is not"
+    " applied cross-node."
     "\n"
     "\n  --parallel_multiple_targets Perform parallel copies from the source "
     "passed with option -s "
@@ -107,6 +117,12 @@ static const char *usage_str =
     "\n                              using all available engines with compute "
     "capability."
     "\n                              Extra options: -x, --divide_buffers"
+    "\n                              In --ipc-mpi mode, acts as topology"
+    " selector: one -s to all"
+    "\n                              -d devices (or all local devices by"
+    " default); cross-node."
+    "\n                              Generated cross-node pairs execute"
+    " concurrently."
     "\n"
     "\n  --parallel_pair_targets     (Experimental) Perform parallel copies "
     "from "
@@ -120,6 +136,13 @@ static const char *usage_str =
     "\n                              with source and destination pairs defined "
     "with a colon."
     "\n                              Example pair list: src1:dst1,src2:dst2 "
+    "\n                              In --ipc-mpi mode, this option can also be"
+    " used to"
+    "\n                              provide explicit local:remote device"
+    " pairs."
+    "\n                              In --ipc-mpi mode, each listed pair"
+    " executes concurrently"
+    "\n                              (requires MPI thread-multiple support)."
     "\n                              Extra options: -x, --divide_buffers"
     "\n"
     "\n  --divide_buffers            for parallel multiple targets test, "
@@ -129,12 +152,27 @@ static const char *usage_str =
     "\n  -x                          for unidirectional parallel tests, select "
     "where to place the queue"
     "\n      src                     use queue in source"
-    "\n      dst                     use queue in source"
+    "\n      dst                     use queue in destination"
     "\n"
     "\n  --ipc                       perform a copy between two devices, "
     "specified by options -s and -d, "
     "\n                              with each device being managed by a "
     "separate process."
+    "\n                              Bidirectional mode is not supported with"
+    " --ipc."
+    "\n  --ipc-mpi                   use MPI control plane for cross-node GPU P2P."
+    "\n                              Launch with exactly 2 MPI ranks."
+    "\n                              In this mode, -s denotes source GPUs and -d"
+    "\n                              denotes destination GPUs."
+    "\n                              Unidirectional: destination (-d) metadata"
+    " is imported to source (-s),"
+    "\n                              and copy executes on source (-s) side."
+    "\n                              Bidirectional (-b): both sides import peer"
+    " metadata and execute copy."
+    "\n  --ipc-mpi-pairs             explicit local:remote device pairs for --ipc-mpi"
+    "\n                              (compatibility option; prefer --parallel_pair_targets)."
+    "\n                              Example: 0:0,0:1,2:3"
+    "\n                              When provided, -s/-d Cartesian expansion is disabled."
     "\n"
     "\n  --version                   display version"
     "\n  -h, --help                  display help message"
@@ -259,7 +297,9 @@ public:
   void bandwidth_latency_ipc(peer_test_t test_type,
                              peer_transfer_t transfer_type, bool is_server,
                              int commSocket, size_t number_buffer_elements,
-                             uint32_t device_id, uint32_t remote_device_id);
+                             uint32_t device_id, uint32_t remote_device_id,
+                             bool use_mpi_remote_exchange = false,
+                             int mpi_msg_tag_base = 0);
 
   void set_up_ipc(size_t number_buffer_elements, uint32_t device_id,
                   size_t &buffer_size, ze_command_queue_handle_t &command_queue,
@@ -297,6 +337,7 @@ public:
   static bool parallel_copy_to_multiple_targets;
   static bool parallel_copy_to_pair_targets;
   static bool parallel_divide_buffers;
+    static bool ipc_mpi_mode;
 
   static uint32_t number_iterations;
   uint32_t warm_up_iterations = number_iterations / 5;

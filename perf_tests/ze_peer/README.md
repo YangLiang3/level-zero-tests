@@ -22,6 +22,8 @@ first compute engine in the device.
 
  OPTIONS:
   -b                          run bidirectional mode. Default: Not set.
+                              For IPC paths, bidirectional is supported only
+                              with --ipc-mpi.
   -c                          run continuously until hitting CTRL+C. Default: Not set.
   -i                          number of iterations to run. Default: 50.
   -z                          size to run in bytes. Default: 8192(8MB) to 268435456(256MB).
@@ -52,19 +54,52 @@ first compute engine in the device.
                               By default, copy is made from device 0 to device 1 using
                               all available engines with compute capability.
                               Extra options: -x
+                              In --ipc-mpi mode, acts as topology selector: one -s to
+                              one -d device; parallel engine split is not applied cross-node.
 
-  --parallel_multiple_targets  Perform parallel copies from the source passed with option -s
+  --parallel_multiple_targets Perform parallel copies from the source passed with option -s
                               to the targets specified with option -d, each one using a
                               separate engine specified with option -u.
                               By default, copy is made from device 0 to all other devices,
                               using all available engines with compute capability.
-                              Extra options: -x
+                              Extra options: -x, --divide_buffers
+                              In --ipc-mpi mode, acts as topology selector: one -s to all
+                              -d devices (or all local devices by default); cross-node.
+                              Generated cross-node pairs execute concurrently.
+
+  --parallel_pair_targets     (Experimental) Perform parallel copies from pairs of source
+                              and targets each one using a separate engine specified with
+                              option -u. Accepts a comma-separated list of pair devices,
+                              with source and destination pairs defined with a colon.
+                              Example pair list: src1:dst1,src2:dst2
+                              In --ipc-mpi mode, this option can also be used to
+                              provide explicit local:remote device pairs.
+                              In --ipc-mpi mode, each listed pair executes
+                              concurrently (requires MPI thread-multiple support).
+                              Extra options: -x, --divide_buffers
+
+  --divide_buffers            for parallel multiple targets test, divide buffers across available
+                              engines specified with option -u.
+
   -x                          for unidirectional parallel tests, select where to place the queue
       src                     use queue in source
-      dst                     use queue in source
+      dst                     use queue in destination
 
   --ipc                       perform a copy between two devices, specified by options -s and -d,
                               with each device being managed by a separate process.
+                              Bidirectional mode is not supported with --ipc.
+  --ipc-mpi                   use MPI control plane for cross-node GPU P2P.
+                              Launch with exactly 2 MPI ranks.
+                              In this mode, -s denotes source GPUs and -d
+                              denotes destination GPUs.
+                              Unidirectional: destination (-d) metadata is imported
+                              to source (-s), and copy executes on source (-s) side.
+                              Bidirectional (-b): both sides import peer metadata
+                              and execute copy.
+  --ipc-mpi-pairs             explicit local:remote device pairs for --ipc-mpi
+                              (compatibility option; prefer --parallel_pair_targets).
+                              Example: 0:0,0:1,2:3
+                              When provided, -s/-d Cartesian expansion is disabled.
 
   --version                   display version
   -h, --help                  display help message
@@ -147,3 +182,68 @@ devices 2 and 3, in addition to those in device 1. All copies are done in parall
 ```
 ./ze_peer --parallel_multiple_targets -t transfer_bw -z 268435456 -s 1 -d 2,3 -u 0,1 -b
 ```
+
+Run same-host IPC between two local devices without MPI:
+```bash
+./ze_peer --ipc -s 0 -d 1 -t transfer_bw -o write -z 268435456
+```
+
+Run cross-node IPC with MPI on two machines (requires `/dev/vmem` support on both hosts):
+```bash
+mpirun -n 2 -hosts hostA,hostB ./ze_peer --ipc-mpi -s 0 -d 0 -t transfer_bw -o write -z 268435456
+```
+
+MPI IPC combinations via parameters (`-s` is source GPU list, `-d` is destination GPU list):
+source/destination semantics are defined by `-s/-d`, not fixed rank numbers.
+
+1:1
+```bash
+mpirun -n 2 -hosts hostA,hostB ./ze_peer --ipc-mpi -s 0 -d 1 -t transfer_bw -o write -z 268435456
+```
+
+1:N
+```bash
+mpirun -n 2 -hosts hostA,hostB ./ze_peer --ipc-mpi -s 0 -d 0,1,2 -t transfer_bw -o write -z 268435456
+```
+
+N:1
+```bash
+mpirun -n 2 -hosts hostA,hostB ./ze_peer --ipc-mpi -s 0,1,2 -d 0 -t transfer_bw -o write -z 268435456
+```
+
+N:N (Cartesian product)
+```bash
+mpirun -n 2 -hosts hostA,hostB ./ze_peer --ipc-mpi -s 0,1 -d 2,3 -t transfer_bw -o write -z 268435456
+```
+
+Bidirectional (`-b`): both ranks execute endpoint for each pair
+
+1:1
+```bash
+mpirun -n 2 -hosts hostA,hostB ./ze_peer --ipc-mpi -b -s 0 -d 1 -t transfer_bw -o write -z 268435456
+```
+
+1:N
+```bash
+mpirun -n 2 -hosts hostA,hostB ./ze_peer --ipc-mpi -b -s 0 -d 0,1,2 -t transfer_bw -o write -z 268435456
+```
+
+N:1
+```bash
+mpirun -n 2 -hosts hostA,hostB ./ze_peer --ipc-mpi -b -s 0,1,2 -d 0 -t transfer_bw -o write -z 268435456
+```
+
+N:N (Cartesian product)
+```bash
+mpirun -n 2 -hosts hostA,hostB ./ze_peer --ipc-mpi -b -s 0,1 -d 2,3 -t transfer_bw -o write -z 268435456
+```
+
+Any explicit combination (not Cartesian) with `--parallel_pair_targets` in `--ipc-mpi` mode
+```bash
+mpirun -n 2 -hosts hostA,hostB ./ze_peer --ipc-mpi --parallel_pair_targets 0:2,1:3,2:1 -t transfer_bw -o write -z 268435456
+```
+
+Rank behavior in `--ipc-mpi` mode:
+- Unidirectional: destination (`-d`) side exports metadata; source (`-s`) side reconstructs peer dma-buf and performs the copy.
+- Bidirectional (`-b`): both sides reconstruct peer dma-buf metadata and both perform copy operations.
+- `-s/-d` define source/destination GPU indices for each pair and are not fixed to rank id.

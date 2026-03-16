@@ -7,6 +7,16 @@
  */
 #include "ze_peer.h"
 
+#include <condition_variable>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <thread>
+
+#if ZE_PEER_ENABLE_MPI
+#include <mpi.h>
+#endif
+
 const std::string version = "2.0";
 
 // Defaults
@@ -18,6 +28,7 @@ bool ZePeer::parallel_copy_to_single_target = false;
 bool ZePeer::parallel_copy_to_multiple_targets = false;
 bool ZePeer::parallel_copy_to_pair_targets = false;
 bool ZePeer::parallel_divide_buffers = false;
+bool ZePeer::ipc_mpi_mode = false;
 uint32_t ZePeer::number_iterations = 50;
 const size_t max_elems = 268435456; /* 256 MB */
 
@@ -32,6 +43,44 @@ template <> inline uint32_t to_u32<char *>(char *str) {
 }
 
 void stress_handler(int signal) { exit(1); }
+
+namespace {
+constexpr int mpi_pair_tag_base = 1024;
+constexpr int mpi_pair_tag_stride = 8;
+constexpr int mpi_pair_tag_slots = 3;
+std::mutex mpi_output_mutex;
+
+class MpiSizeStepBarrier {
+public:
+  explicit MpiSizeStepBarrier(unsigned int participants)
+      : participants_(participants), pending_(participants), generation_(0) {}
+
+  void wait() {
+    if (participants_ <= 1) {
+      return;
+    }
+
+    std::unique_lock<std::mutex> lock(mutex_);
+    const unsigned int current_generation = generation_;
+
+    if (--pending_ == 0) {
+      generation_++;
+      pending_ = participants_;
+      condition_.notify_all();
+      return;
+    }
+
+    condition_.wait(lock, [&] { return generation_ != current_generation; });
+  }
+
+private:
+  unsigned int participants_;
+  unsigned int pending_;
+  unsigned int generation_;
+  std::mutex mutex_;
+  std::condition_variable condition_;
+};
+} // namespace
 
 void print_results_header(
     std::vector<uint32_t> remote_device_ids,
@@ -83,11 +132,108 @@ void print_results_header(
 
 void run_ipc_test(int size_to_run, uint32_t remote_device_id,
                   uint32_t local_device_id, uint32_t queue,
-                  peer_test_t test_type, peer_transfer_t transfer_type) {
+                  peer_test_t test_type, peer_transfer_t transfer_type,
+                  bool use_mpi_ipc = false,
+                  int mpi_msg_tag_base = 0,
+                  MpiSizeStepBarrier *size_step_barrier = nullptr) {
 
-  if (ZePeer::bidirectional) {
-    std::cerr << "[ERROR] Bidirectional mode with IPC tests not implemented\n";
+  if (ZePeer::bidirectional && !use_mpi_ipc) {
+    std::cerr << "[ERROR] Bidirectional mode is only supported with --ipc-mpi\n";
     return;
+  }
+
+  std::vector<uint32_t> remote_device_ids{remote_device_id};
+  std::vector<uint32_t> local_device_ids{local_device_id};
+  std::vector<std::pair<uint32_t, uint32_t>> pair_device_ids{};
+  std::vector<uint32_t> queues{queue};
+  if (!use_mpi_ipc) {
+    print_results_header(remote_device_ids, local_device_ids, pair_device_ids,
+                         test_type, transfer_type);
+  }
+
+  if (use_mpi_ipc) {
+#if ZE_PEER_ENABLE_MPI
+    int mpi_rank = 0;
+    int mpi_size = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+
+    if (mpi_size != 2) {
+      if (mpi_rank == 0) {
+        std::cerr << "[ERROR] --ipc-mpi requires exactly 2 MPI ranks\n";
+      }
+      return;
+    }
+
+    if (mpi_rank == 0) {
+      std::lock_guard<std::mutex> lock(mpi_output_mutex);
+      print_results_header(remote_device_ids, local_device_ids, pair_device_ids,
+                           test_type, transfer_type);
+    }
+
+    // --ipc-mpi semantic:
+    //   -s local_device_id  = source GPU index for the pair
+    //   -d remote_device_id = destination GPU index for the pair
+    // Source/destination meaning is driven by -s/-d values, not fixed rank
+    // numbers. Unidirectional executes on source side; with -b both sides
+    // execute for each configured pair.
+    const uint32_t current_rank_device_id =
+        (mpi_rank == 0) ? remote_device_id : local_device_id;
+    const uint32_t peer_rank_device_id =
+        (mpi_rank == 0) ? local_device_id : remote_device_id;
+
+    // In the current 2-rank mapping, the side represented by pair.first (-s)
+    // is the source execution side.
+    const bool is_source_side = (mpi_rank != 0);
+    const bool execute_copy_on_this_rank = ZePeer::bidirectional || is_source_side;
+
+    // In cross-node mode each rank should only validate and allocate on its
+    // own local device index.
+    std::vector<uint32_t> rank_remote_device_ids{current_rank_device_id};
+    std::vector<uint32_t> rank_local_device_ids{current_rank_device_id};
+
+    ZePeer peer(rank_remote_device_ids,
+                rank_local_device_ids,
+                pair_device_ids,
+                queues);
+    if (ZePeer::validate_results) {
+      peer.warm_up_iterations = 0;
+      peer.number_iterations = 1;
+    }
+
+    for (size_t num_elems = 8; num_elems <= max_elems; num_elems *= 2) {
+      if (size_to_run != -1) {
+        num_elems = static_cast<size_t>(size_to_run);
+      }
+
+      peer.bandwidth_latency_ipc(test_type,
+                                 transfer_type,
+                                 !execute_copy_on_this_rank,
+                                 -1,
+                                 num_elems,
+                                 current_rank_device_id,
+                                 peer_rank_device_id,
+                                 true /* use_mpi_remote_exchange */,
+                                 mpi_msg_tag_base);
+
+      if (size_to_run == -1 && size_step_barrier != nullptr) {
+        size_step_barrier->wait();
+      }
+
+      if (size_to_run != -1) {
+        break;
+      }
+    }
+
+    if (mpi_rank == 0) {
+      std::cout << std::endl;
+    }
+    return;
+#else
+    std::cerr << "[ERROR] ze_peer was built without MPI support; rebuild with "
+                 "MPI to use --ipc-mpi\n";
+    return;
+#endif
   }
 
   pid_t pid;
@@ -96,13 +242,6 @@ void run_ipc_test(int size_to_run, uint32_t remote_device_id,
     perror("socketpair");
     exit(1);
   }
-
-  std::vector<uint32_t> remote_device_ids{remote_device_id};
-  std::vector<uint32_t> local_device_ids{local_device_id};
-  std::vector<std::pair<uint32_t, uint32_t>> pair_device_ids{};
-  std::vector<uint32_t> queues{queue};
-  print_results_header(remote_device_ids, local_device_ids, pair_device_ids,
-                       test_type, transfer_type);
 
   for (size_t num_elems = 8; num_elems <= max_elems; num_elems *= 2) {
     if (size_to_run != -1) {
@@ -122,6 +261,7 @@ void run_ipc_test(int size_to_run, uint32_t remote_device_id,
         peer.bandwidth_latency_ipc(test_type, transfer_type,
                                    false /* is_server */, sv[1], num_elems,
                                    local_device_id, remote_device_id);
+        _exit(0);
       } else {
         ZePeer peer(remote_device_ids, local_device_ids, pair_device_ids,
                     queues);
@@ -133,6 +273,7 @@ void run_ipc_test(int size_to_run, uint32_t remote_device_id,
         peer.bandwidth_latency_ipc(test_type, transfer_type,
                                    true /* is_server */, sv[0], num_elems,
                                    remote_device_id, local_device_id);
+        _exit(0);
       }
     } else {
       int child_status;
@@ -198,7 +339,7 @@ void run_test(int size_to_run, std::vector<uint32_t> &remote_device_ids,
           std::cerr
               << "[ERROR] Number of engines passed with option -u needs to be "
               << "divisible by 2 for parallel_multiple_targets test when using"
-              << "-l option\n";
+              << " --divide_buffers\n";
           return;
         }
         peer.bandwidth_latency_parallel_to_multiple_targets(
@@ -210,7 +351,7 @@ void run_test(int size_to_run, std::vector<uint32_t> &remote_device_ids,
           std::cerr
               << "[ERROR] Number of engines passed with option -u needs to be "
               << "divisible by 2 for parallel_pair_targets test when using"
-              << "-l option\n";
+              << " --divide_buffers\n";
           return;
         }
         peer.bandwidth_latency_parallel_to_pair_targets(
@@ -224,6 +365,11 @@ void run_test(int size_to_run, std::vector<uint32_t> &remote_device_ids,
         }
         if (local_device_ids.size() > 1) {
           std::cerr << "[ERROR] Number of src devices needs to be one "
+                    << "for parallel_single_target test\n";
+          return;
+        }
+        if (remote_device_ids.front() == local_device_ids.front()) {
+          std::cerr << "[ERROR] Source and destination devices must be different "
                     << "for parallel_single_target test\n";
           return;
         }
@@ -247,9 +393,12 @@ void run_test(int size_to_run, std::vector<uint32_t> &remote_device_ids,
 
 int main(int argc, char **argv) {
   bool run_ipc = false;
+  bool ipc_pairs_from_parallel_pair_targets = false;
+  bool ipc_pairs_from_legacy_option = false;
   std::vector<uint32_t> remote_device_ids{};
   std::vector<uint32_t> local_device_ids{};
   std::vector<std::pair<uint32_t, uint32_t>> pair_device_ids{};
+  std::vector<std::pair<uint32_t, uint32_t>> ipc_mpi_pair_device_ids{};
   std::vector<uint32_t> queues{};
   int size_to_run = -1;
   peer_transfer_t transfer_type_to_run = PEER_TRANSFER_MAX;
@@ -258,7 +407,7 @@ int main(int argc, char **argv) {
 
   auto parse_and_insert = [&](std::string &s,
                               std::vector<uint32_t> &vector_of_indexes) {
-    if (isdigit(s[0])) {
+    if (!s.empty() && isdigit(static_cast<unsigned char>(s[0]))) {
       vector_of_indexes.push_back(to_u32(s.c_str()));
     } else {
       std::cerr << usage_str;
@@ -278,7 +427,8 @@ int main(int argc, char **argv) {
 
         if ((pos = s.find(colon, start)) != std::string::npos) {
           device_id_string = s.substr(start, pos);
-          if (isdigit(device_id_string[0])) {
+          if (!device_id_string.empty() &&
+              isdigit(static_cast<unsigned char>(device_id_string[0]))) {
             local_device_id = to_u32(device_id_string.c_str());
           } else {
             std::cerr << usage_str;
@@ -287,7 +437,8 @@ int main(int argc, char **argv) {
 
           start = pos + 1;
           device_id_string = s.substr(start, s.length());
-          if (isdigit(device_id_string[0])) {
+          if (!device_id_string.empty() &&
+              isdigit(static_cast<unsigned char>(device_id_string[0]))) {
             remote_device_id = to_u32(device_id_string.c_str());
             vector_of_indexes.push_back(
                 std::make_pair(local_device_id, remote_device_id));
@@ -313,7 +464,11 @@ int main(int argc, char **argv) {
       peer.query_engines();
       exit(0);
     } else if ((strcmp(argv[i], "-i") == 0)) {
-      if (isdigit(argv[i + 1][0])) {
+      if ((i + 1) >= argc) {
+        std::cout << usage_str;
+        exit(-1);
+      }
+      if (isdigit(static_cast<unsigned char>(argv[i + 1][0]))) {
         ZePeer::number_iterations = to_u32(argv[i + 1]);
       } else {
         std::cout << usage_str;
@@ -360,26 +515,57 @@ int main(int argc, char **argv) {
       ZePeer::parallel_copy_to_multiple_targets = true;
     } else if (strcmp(argv[i], "--parallel_pair_targets") == 0) {
       ZePeer::parallel_copy_to_pair_targets = true;
-      std::string pair_device_ids_string = argv[i + 1];
+      // Optional pair list for this mode:
+      //   --parallel_pair_targets src0:dst0,src1:dst1
+      if ((i + 1) < argc && argv[i + 1][0] != '-') {
+        std::string pair_device_ids_string = argv[i + 1];
+        const std::string comma = ",";
+
+        size_t pos = 0;
+        size_t start = 0;
+        std::string pair_device_id_string = "";
+        while ((pos = pair_device_ids_string.find(comma, start)) !=
+               std::string::npos) {
+          pair_device_id_string = pair_device_ids_string.substr(start, pos);
+          start = pos + 1;
+          parse_and_insert_pairs(pair_device_id_string, pair_device_ids);
+        }
+        pair_device_id_string = pair_device_ids_string.substr(
+            start, pair_device_ids_string.length());
+        parse_and_insert_pairs(pair_device_id_string, pair_device_ids);
+        i++;
+      }
+    } else if (strcmp(argv[i], "--divide_buffers") == 0) {
+      ZePeer::parallel_divide_buffers = true;
+    } else if (strcmp(argv[i], "--ipc") == 0) {
+      run_ipc = true;
+    } else if (strcmp(argv[i], "--ipc-mpi") == 0) {
+      run_ipc = true;
+      ZePeer::ipc_mpi_mode = true;
+    } else if (strcmp(argv[i], "--ipc-mpi-pairs") == 0) {
+      if ((i + 1) >= argc) {
+        std::cout << usage_str;
+        exit(-1);
+      }
+
+      ipc_pairs_from_legacy_option = true;
+
+      std::string mpi_pair_device_ids_string = argv[i + 1];
       const std::string comma = ",";
 
       size_t pos = 0;
       size_t start = 0;
       std::string pair_device_id_string = "";
-      while ((pos = pair_device_ids_string.find(comma, start)) !=
+      while ((pos = mpi_pair_device_ids_string.find(comma, start)) !=
              std::string::npos) {
-        pair_device_id_string = pair_device_ids_string.substr(start, pos);
+        pair_device_id_string = mpi_pair_device_ids_string.substr(start, pos);
         start = pos + 1;
-        parse_and_insert_pairs(pair_device_id_string, pair_device_ids);
+        parse_and_insert_pairs(pair_device_id_string, ipc_mpi_pair_device_ids);
       }
-      pair_device_id_string =
-          pair_device_ids_string.substr(start, pair_device_ids_string.length());
-      parse_and_insert_pairs(pair_device_id_string, pair_device_ids);
+      pair_device_id_string = mpi_pair_device_ids_string.substr(
+          start, mpi_pair_device_ids_string.length());
+      parse_and_insert_pairs(pair_device_id_string, ipc_mpi_pair_device_ids);
       i++;
-    } else if (strcmp(argv[i], "--divide_buffers") == 0) {
-      ZePeer::parallel_divide_buffers = true;
-    } else if (strcmp(argv[i], "--ipc") == 0) {
-      run_ipc = true;
     } else if ((strcmp(argv[i], "-x") == 0)) {
       if ((i + 1) >= argc) {
         std::cout << usage_str;
@@ -396,6 +582,10 @@ int main(int argc, char **argv) {
         exit(-1);
       }
     } else if (strcmp(argv[i], "-d") == 0) {
+      if ((i + 1) >= argc) {
+        std::cout << usage_str;
+        exit(-1);
+      }
       std::string remote_device_ids_string = argv[i + 1];
       const std::string comma = ",";
 
@@ -413,6 +603,10 @@ int main(int argc, char **argv) {
       parse_and_insert(device_id_string, remote_device_ids);
       i++;
     } else if (strcmp(argv[i], "-s") == 0) {
+      if ((i + 1) >= argc) {
+        std::cout << usage_str;
+        exit(-1);
+      }
       std::string local_device_ids_string = argv[i + 1];
       const std::string comma = ",";
 
@@ -430,6 +624,10 @@ int main(int argc, char **argv) {
       parse_and_insert(device_id_string, local_device_ids);
       i++;
     } else if (strcmp(argv[i], "-u") == 0) {
+      if ((i + 1) >= argc) {
+        std::cout << usage_str;
+        exit(-1);
+      }
       std::string local_queues_string = argv[i + 1];
       const std::string comma = ",";
 
@@ -448,7 +646,11 @@ int main(int argc, char **argv) {
 
       i++;
     } else if (strcmp(argv[i], "-z") == 0) {
-      if (isdigit(argv[i + 1][0])) {
+      if ((i + 1) >= argc) {
+        std::cout << usage_str;
+        exit(-1);
+      }
+      if (isdigit(static_cast<unsigned char>(argv[i + 1][0]))) {
         size_to_run = std::min(atoi(argv[i + 1]), static_cast<int>(max_elems));
       } else {
         std::cout << usage_str;
@@ -463,17 +665,279 @@ int main(int argc, char **argv) {
     }
   }
 
+  // In MPI cross-node mode, allow --parallel_pair_targets to be used as the
+  // explicit pair selector (alias to --ipc-mpi-pairs semantics).
+  if (ZePeer::ipc_mpi_mode && run_ipc && ZePeer::parallel_copy_to_pair_targets) {
+    if (!pair_device_ids.empty()) {
+      if (!ipc_mpi_pair_device_ids.empty()) {
+        std::cerr << "[ERROR] Do not use both --parallel_pair_targets <pairs> "
+                     "and --ipc-mpi-pairs together\n";
+        return -1;
+      }
+
+      ipc_mpi_pair_device_ids = pair_device_ids;
+      ipc_pairs_from_parallel_pair_targets = true;
+      ipc_pairs_from_legacy_option = false;
+    }
+
+    // In --ipc-mpi mode this option is interpreted as pair-list selector,
+    // not as local parallel execution mode.
+    ZePeer::parallel_copy_to_pair_targets = false;
+  }
+
+  if (!ipc_mpi_pair_device_ids.empty() && !(ZePeer::ipc_mpi_mode && run_ipc)) {
+    std::cerr << "[ERROR] --ipc-mpi-pairs requires --ipc-mpi\n";
+    return -1;
+  }
+
   if (run_ipc == false) {
     // Detect number of devices
     ZePeer peerQueryDevices(&num_devices);
   }
 
-  if (run_ipc) {
+  if (run_ipc && !ZePeer::ipc_mpi_mode) {
     std::cout << "============================================================="
                  "===================\n"
               << "IPC tests\n"
               << "============================================================="
                  "===================\n";
+  }
+
+  if (ZePeer::ipc_mpi_mode && run_ipc) {
+#if ZE_PEER_ENABLE_MPI
+    int mpi_initialized = 0;
+    int mpi_thread_level = MPI_THREAD_SINGLE;
+    MPI_Initialized(&mpi_initialized);
+    if (!mpi_initialized) {
+      MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &mpi_thread_level);
+    } else {
+      MPI_Query_thread(&mpi_thread_level);
+    }
+
+    int mpi_rank = 0;
+    int mpi_size = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+
+    if (mpi_size != 2) {
+      if (mpi_rank == 0) {
+        std::cerr << "[ERROR] --ipc-mpi requires exactly 2 MPI ranks\n";
+      }
+      MPI_Finalize();
+      return -1;
+    }
+
+    if (queues.empty()) {
+      queues.push_back(0);
+    }
+
+    // In --ipc-mpi mode, --parallel_single_target / --parallel_multiple_targets
+    // act as cross-node topology selectors (device pairing), not as
+    // parallel-engine modes (those are intra-node only).
+    if (ZePeer::parallel_copy_to_single_target ||
+        ZePeer::parallel_copy_to_multiple_targets) {
+      if (!ipc_mpi_pair_device_ids.empty()) {
+        if (mpi_rank == 0) {
+          std::cerr << "[ERROR] Cannot combine --parallel_single_target/"
+                       "--parallel_multiple_targets with an explicit pair list "
+                       "in --ipc-mpi mode\n";
+        }
+        MPI_Finalize();
+        return -1;
+      }
+      if (local_device_ids.size() > 1) {
+        if (mpi_rank == 0) {
+          std::cerr << "[ERROR] --parallel_single_target/--parallel_multiple_targets "
+                       "in --ipc-mpi mode: only one -s device is allowed\n";
+        }
+        MPI_Finalize();
+        return -1;
+      }
+      if (local_device_ids.empty()) {
+        local_device_ids.push_back(0u);
+      }
+      const uint32_t default_src = local_device_ids.front();
+
+      if (ZePeer::parallel_copy_to_single_target) {
+        if (remote_device_ids.size() > 1) {
+          if (mpi_rank == 0) {
+            std::cerr << "[ERROR] --parallel_single_target in --ipc-mpi mode: "
+                         "only one -d device is allowed\n";
+          }
+          MPI_Finalize();
+          return -1;
+        }
+        if (remote_device_ids.empty()) {
+          // Default: same device index on the remote rank (cross-node peer).
+          remote_device_ids.push_back(default_src);
+        }
+      } else {
+        // --parallel_multiple_targets: default to all local device indices.
+        if (remote_device_ids.empty()) {
+          uint32_t mpi_num_devices = 0;
+          ZePeer peerQuery(&mpi_num_devices);
+          for (uint32_t id = 0; id < mpi_num_devices; id++) {
+            remote_device_ids.push_back(id);
+          }
+          if (remote_device_ids.empty()) {
+            if (mpi_rank == 0) {
+              std::cerr << "[ERROR] --parallel_multiple_targets in --ipc-mpi "
+                           "mode: no remote devices found\n";
+            }
+            MPI_Finalize();
+            return -1;
+          }
+        }
+      }
+
+    }
+
+    if (ipc_mpi_pair_device_ids.empty()) {
+      if (local_device_ids.empty()) {
+        local_device_ids.push_back(0);
+      }
+      if (remote_device_ids.empty()) {
+        // In cross-node mode, default remote index follows first local index.
+        remote_device_ids.push_back(local_device_ids.front());
+      }
+
+      for (auto local_device_id : local_device_ids) {
+        for (auto remote_device_id : remote_device_ids) {
+          ipc_mpi_pair_device_ids.push_back(
+              std::make_pair(local_device_id, remote_device_id));
+        }
+      }
+    }
+
+    if (ipc_mpi_pair_device_ids.empty()) {
+      if (mpi_rank == 0) {
+        std::cerr << "[ERROR] No IPC device pairs were generated\n";
+      }
+      MPI_Finalize();
+      return -1;
+    }
+
+    const bool run_pairs_concurrently =
+        ipc_mpi_pair_device_ids.size() > 1;
+    if (run_pairs_concurrently && mpi_thread_level < MPI_THREAD_MULTIPLE) {
+      if (mpi_rank == 0) {
+        std::cerr << "[ERROR] MPI implementation does not provide "
+                     "MPI_THREAD_MULTIPLE; cannot run multiple IPC pairs "
+                     "concurrently\n";
+      }
+      MPI_Finalize();
+      return -1;
+    }
+
+    int *mpi_tag_ub_ptr = nullptr;
+    int mpi_tag_ub_flag = 0;
+    int mpi_tag_ub = 32767;
+    MPI_Comm_get_attr(MPI_COMM_WORLD, MPI_TAG_UB, &mpi_tag_ub_ptr,
+                      &mpi_tag_ub_flag);
+    if (mpi_tag_ub_flag && mpi_tag_ub_ptr) {
+      mpi_tag_ub = *mpi_tag_ub_ptr;
+    }
+
+    const int max_required_tag =
+        mpi_pair_tag_base +
+        static_cast<int>(ipc_mpi_pair_device_ids.size() - 1) *
+            mpi_pair_tag_stride +
+        (mpi_pair_tag_slots - 1);
+    if (max_required_tag > mpi_tag_ub) {
+      if (mpi_rank == 0) {
+        std::cerr << "[ERROR] Too many IPC pairs for MPI tag space: "
+                  << ipc_mpi_pair_device_ids.size()
+                  << " pairs require tag up to " << max_required_tag
+                  << ", MPI_TAG_UB=" << mpi_tag_ub << "\n";
+      }
+      MPI_Finalize();
+      return -1;
+    }
+
+    if (mpi_rank == 0) {
+      std::cout << "============================================================="
+                   "===================\n"
+                << "MPI cross-node IPC mode\n"
+                << "============================================================="
+                   "===================\n";
+    }
+
+    for (uint32_t test_type = 0;
+         test_type < static_cast<uint32_t>(PEER_TEST_MAX); test_type++) {
+      if (test_type_to_run != PEER_TEST_MAX &&
+          static_cast<peer_test_t>(test_type) != test_type_to_run) {
+        continue;
+      }
+
+      for (uint32_t transfer_type = 0;
+           transfer_type < static_cast<uint32_t>(PEER_TRANSFER_MAX);
+           transfer_type++) {
+        if (transfer_type_to_run != PEER_TRANSFER_MAX &&
+            static_cast<peer_transfer_t>(transfer_type) !=
+                transfer_type_to_run) {
+          continue;
+        }
+
+        const auto current_test_type = static_cast<peer_test_t>(test_type);
+        const auto current_transfer_type =
+            static_cast<peer_transfer_t>(transfer_type);
+
+        if (mpi_rank == 0) {
+          std::cout << "-----------------------------------------------------"
+                       "---------------------------\n";
+        }
+
+        std::unique_ptr<MpiSizeStepBarrier> size_step_barrier;
+        if (run_pairs_concurrently && size_to_run == -1) {
+          size_step_barrier = std::make_unique<MpiSizeStepBarrier>(
+              static_cast<unsigned int>(ipc_mpi_pair_device_ids.size()));
+        }
+
+        auto run_pair = [&](size_t pair_index) {
+          const auto &device_pair = ipc_mpi_pair_device_ids[pair_index];
+          const int pair_tag_base =
+              mpi_pair_tag_base +
+              static_cast<int>(pair_index) * mpi_pair_tag_stride;
+
+          run_ipc_test(size_to_run,
+                       device_pair.second,
+                       device_pair.first,
+                       queues[pair_index % queues.size()],
+                       current_test_type,
+                       current_transfer_type,
+                       true,
+                       pair_tag_base,
+                       size_step_barrier.get());
+        };
+
+        if (run_pairs_concurrently) {
+          std::vector<std::thread> pair_workers;
+          pair_workers.reserve(ipc_mpi_pair_device_ids.size());
+          for (size_t pair_index = 0;
+               pair_index < ipc_mpi_pair_device_ids.size();
+               pair_index++) {
+            pair_workers.emplace_back(run_pair, pair_index);
+          }
+          for (auto &worker : pair_workers) {
+            worker.join();
+          }
+        } else {
+          run_pair(0);
+        }
+
+        if (mpi_rank == 0) {
+          std::cout << "-----------------------------------------------------"
+                       "---------------------------\n";
+        }
+      }
+    }
+
+    MPI_Finalize();
+    return 0;
+#else
+    std::cerr << "[ERROR] ze_peer was built without MPI support; rebuild with MPI to use --ipc-mpi\n";
+    return -1;
+#endif
   }
 
   std::cout << "============================================================="
@@ -494,22 +958,44 @@ int main(int argc, char **argv) {
       local_device_ids.push_back(0u);
     }
 
+    const uint32_t default_source_device_id = local_device_ids.front();
+
     // set default destination devices
     if (remote_device_ids.empty()) {
       if (ZePeer::parallel_copy_to_single_target) {
-        remote_device_ids.push_back(0u);
+        if (num_devices < 2) {
+          std::cerr << "[ERROR] parallel_single_target requires at least 2 devices\n";
+          return -1;
+        }
+        remote_device_ids.push_back(
+            (default_source_device_id == 0u) ? 1u : 0u);
       } else if (ZePeer::parallel_copy_to_multiple_targets) {
         for (uint32_t remote_device_id = 0; remote_device_id < num_devices;
              remote_device_id++) {
-          remote_device_ids.push_back(remote_device_id);
+          if (remote_device_id != default_source_device_id) {
+            remote_device_ids.push_back(remote_device_id);
+          }
+        }
+
+        if (remote_device_ids.empty()) {
+          std::cerr << "[ERROR] parallel_multiple_targets requires at least one destination device\n";
+          return -1;
         }
       }
     }
 
     if (ZePeer::parallel_copy_to_pair_targets && pair_device_ids.empty()) {
+      if (num_devices < 2) {
+        std::cerr << "[ERROR] parallel_pair_targets requires at least 2 devices\n";
+        return -1;
+      }
+
       for (uint32_t remote_device_id = 0; remote_device_id < num_devices;
            remote_device_id++) {
-        pair_device_ids.push_back(std::make_pair(0u, remote_device_id));
+        if (remote_device_id != default_source_device_id) {
+          pair_device_ids.push_back(
+              std::make_pair(default_source_device_id, remote_device_id));
+        }
       }
     }
 
@@ -619,7 +1105,8 @@ ZePeer::ZePeer(uint32_t *num_devices) {
     *num_devices = device_count;
   }
 
-  if (this->device_count <= 1) {
+  if (this->device_count == 0 ||
+      (this->device_count <= 1 && !ZePeer::ipc_mpi_mode)) {
     std::cerr << "ERROR: More than 1 device needed" << std::endl;
     std::terminate();
   }
@@ -634,12 +1121,31 @@ ZePeer::ZePeer(std::vector<uint32_t> &remote_device_ids,
 
   this->device_count = benchmark->allDevicesInit();
 
-  if (this->device_count <= 1) {
+  if (this->device_count == 0 ||
+      (this->device_count <= 1 && !ZePeer::ipc_mpi_mode)) {
     std::cerr << "ERROR: More than 1 device needed" << std::endl;
     std::terminate();
   }
 
-  if (ZePeer::parallel_copy_to_pair_targets) {
+  if (ZePeer::ipc_mpi_mode) {
+    for (auto dst_device_id : remote_device_ids) {
+      if (benchmark->_devices.size() < dst_device_id + 1) {
+        std::cout << "ERROR: Destination device index out of range: "
+                  << dst_device_id << ", available devices: "
+                  << benchmark->_devices.size() << std::endl;
+        std::terminate();
+      }
+    }
+
+    for (auto src_device_id : local_device_ids) {
+      if (benchmark->_devices.size() < src_device_id + 1) {
+        std::cout << "ERROR: Source device index out of range: "
+                  << src_device_id << ", available devices: "
+                  << benchmark->_devices.size() << std::endl;
+        std::terminate();
+      }
+    }
+  } else if (ZePeer::parallel_copy_to_pair_targets) {
     for (auto pair_device_id : pair_device_ids) {
       if (benchmark->_devices.size() <
           std::max(pair_device_id.second + 1, pair_device_id.first + 1)) {

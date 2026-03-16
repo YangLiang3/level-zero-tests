@@ -3,6 +3,10 @@
 
 if(UNIX)
     set(OS_SPECIFIC_LIBS pthread rt)
+  find_package(MPI QUIET COMPONENTS CXX)
+  if(MPI_CXX_FOUND)
+    list(APPEND OS_SPECIFIC_LIBS MPI::MPI_CXX)
+  endif()
 else()
     set(OS_SPECIFIC_LIBS "")
 endif()
@@ -23,3 +27,11 @@ add_lzt_test(
   LINK_LIBRARIES ${OS_SPECIFIC_LIBS}
   KERNELS ze_peer_benchmarks
 )
+
+  if(TARGET ze_peer)
+    if(MPI_CXX_FOUND)
+      target_compile_definitions(ze_peer PRIVATE ZE_PEER_ENABLE_MPI=1)
+    else()
+      target_compile_definitions(ze_peer PRIVATE ZE_PEER_ENABLE_MPI=0)
+    endif()
+  endif()

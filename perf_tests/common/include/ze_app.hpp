@@ -54,6 +54,7 @@ public:
   void commandListClose(ze_command_list_handle_t phCommandList);
   void commandListReset(ze_command_list_handle_t phCommandList);
   void getIpcHandle(void *ptr, ze_ipc_mem_handle_t *pIpcHandle);
+  void putIpcHandle(ze_ipc_mem_handle_t pIpcHandle);
   void closeIpcHandle(void *ipc_ptr);
   void commandListAppendImageCopyFromMemory(
       ze_command_list_handle_t command_list, ze_image_handle_t image,
