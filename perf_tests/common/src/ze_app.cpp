@@ -250,6 +250,10 @@ void ZeApp::getIpcHandle(void *ptr, ze_ipc_mem_handle_t *pIpcHandle) {
   SUCCESS_OR_TERMINATE(zeMemGetIpcHandle(context, ptr, pIpcHandle));
 }
 
+void ZeApp::putIpcHandle(ze_ipc_mem_handle_t pIpcHandle) {
+  SUCCESS_OR_TERMINATE(zeMemPutIpcHandle(context, pIpcHandle));
+}
+
 void ZeApp::closeIpcHandle(void *ipc_ptr) {
   SUCCESS_OR_TERMINATE(zeMemCloseIpcHandle(context, ipc_ptr));
 }

@@ -8,6 +8,13 @@
 
 #include "ze_peer.h"
 
+#include <mutex>
+#include <sstream>
+
+namespace {
+std::mutex result_output_mutex;
+}
+
 void ZePeer::query_engines() {
   for (uint32_t device_index = 0;
        device_index < static_cast<uint32_t>(benchmark->_devices.size());
@@ -104,17 +111,21 @@ void ZePeer::print_results(bool bidirectional, peer_test_t test_type,
     buffer_format_str = "  B";
   }
 
+  std::ostringstream output_stream;
   if (test_type == PEER_BANDWIDTH) {
-    std::cout << "BW [GBPS]: " << std::fixed << std::setw(4)
-              << buffer_size_formatted << buffer_format_str << ": "
-              << std::fixed << std::setw(8) << std::setprecision(2)
-              << total_bandwidth << std::endl;
+    output_stream << "BW [GBPS]: " << std::fixed << std::setw(4)
+                  << buffer_size_formatted << buffer_format_str << ": "
+                  << std::fixed << std::setw(8) << std::setprecision(2)
+                  << total_bandwidth;
   } else {
-    std::cout << "Latency [us]: " << std::fixed << std::setw(4)
-              << buffer_size_formatted << buffer_format_str << ": "
-              << std::fixed << std::setw(8) << std::setprecision(2)
-              << total_time_usec << std::endl;
+    output_stream << "Latency [us]: " << std::fixed << std::setw(4)
+                  << buffer_size_formatted << buffer_format_str << ": "
+                  << std::fixed << std::setw(8) << std::setprecision(2)
+                  << total_time_usec;
   }
+
+  std::lock_guard<std::mutex> lock(result_output_mutex);
+  std::cout << output_stream.str() << std::endl;
 }
 
 void ZePeer::set_up(size_t number_buffer_elements,
