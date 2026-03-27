@@ -9,7 +9,10 @@
 #include "ze_peer.h"
 
 #include <cerrno>
+#include <cstdarg>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 #include <mutex>
 #include <sys/ioctl.h>
@@ -29,6 +32,29 @@ constexpr int mpi_get_pfn_retry_count = 3;
 std::mutex ze_ipc_api_mutex;
 std::mutex vmem_ioctl_mutex;
 std::mutex mpi_get_pfn_mutex;
+
+bool ze_peer_mpi_debug_enabled() {
+  static int enabled = []() {
+    const char *env = std::getenv("ZE_PEER_IPC_MPI_DEBUG");
+    return (env != nullptr && std::strcmp(env, "0") != 0) ? 1 : 0;
+  }();
+  return enabled != 0;
+}
+
+void ze_peer_mpi_debug_log(int rank, const char *fmt, ...) {
+  if (!ze_peer_mpi_debug_enabled()) {
+    return;
+  }
+
+  std::fprintf(stderr, "[ZE_PEER_MPI][rank=%d][pid=%d] ", rank,
+               static_cast<int>(getpid()));
+  va_list ap;
+  va_start(ap, fmt);
+  std::vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  std::fprintf(stderr, "\n");
+  std::fflush(stderr);
+}
 
 struct vmem_pfn_list {
   int nents;
@@ -77,6 +103,12 @@ void mpi_pair_sync_or_abort(int mpi_rank, int mpi_tag) {
   const int peer_rank = 1 - mpi_rank;
   int send_token = 1;
   int recv_token = 0;
+
+  ze_peer_mpi_debug_log(mpi_rank,
+                        "sync begin: peer_rank=%d tag=%d",
+                        peer_rank,
+                        mpi_tag);
+
   int ret = MPI_Sendrecv(&send_token,
                          1,
                          MPI_INT,
@@ -89,6 +121,14 @@ void mpi_pair_sync_or_abort(int mpi_rank, int mpi_tag) {
                          mpi_tag,
                          MPI_COMM_WORLD,
                          MPI_STATUS_IGNORE);
+
+  ze_peer_mpi_debug_log(mpi_rank,
+                        "sync end: peer_rank=%d tag=%d ret=%d recv_token=%d",
+                        peer_rank,
+                        mpi_tag,
+                        ret,
+                        recv_token);
+
   if (ret != MPI_SUCCESS) {
     mpi_abort_with_message("MPI_Sendrecv failed while synchronizing pair");
   }
@@ -100,6 +140,12 @@ void exchange_ipc_mpi(ZePeer *peer,
                       void **remote_ipc_buffer,
                       int metadata_tag) {
   int vmem_fd = open(vmem_dev_path, O_RDWR);
+  ze_peer_mpi_debug_log(mpi_rank,
+                        "open %s => fd=%d local_device=%u metadata_tag=%d",
+                        vmem_dev_path,
+                        vmem_fd,
+                        local_device_id,
+                        metadata_tag);
   if (vmem_fd < 0) {
     mpi_abort_with_message(std::string("Failed to open ") + vmem_dev_path +
                            ": " + strerror(errno));
@@ -133,8 +179,22 @@ void exchange_ipc_mpi(ZePeer *peer,
 
       {
         std::lock_guard<std::mutex> ioctl_lock(vmem_ioctl_mutex);
+        ze_peer_mpi_debug_log(mpi_rank,
+                              "ioctl GET_PFN_LIST begin: attempt=%d rank=%d "
+                              "device_id=0x%x dma_fd=%d",
+                              attempt,
+                              local_data.rank,
+                              local_data.device_id,
+                              local_data.fd);
         ioctl_ret =
             ioctl(vmem_fd, ZE_PEER_VMEM_IOCTL_GET_PFN_LIST, &local_data);
+        ze_peer_mpi_debug_log(mpi_rank,
+                              "ioctl GET_PFN_LIST end: attempt=%d ret=%d "
+                              "errno=%d nents=%d",
+                              attempt,
+                              ioctl_ret,
+                              errno,
+                              local_data.pfn_list.nents);
       }
 
       {
@@ -175,6 +235,14 @@ void exchange_ipc_mpi(ZePeer *peer,
 
   mpi_exchange_data recv_data{};
   int peer_rank = 1 - mpi_rank;
+  ze_peer_mpi_debug_log(mpi_rank,
+                        "metadata exchange begin: peer_rank=%d tag=%d "
+                        "local_dma_fd=%d local_device_id=0x%x pfn_nents=%d",
+                        peer_rank,
+                        metadata_tag,
+                        send_data.dma_buf_fd,
+                        send_data.device_id,
+                        send_data.pfn_list.nents);
   int mpi_ret = MPI_Sendrecv(&send_data,
                              sizeof(send_data),
                              MPI_BYTE,
@@ -187,6 +255,13 @@ void exchange_ipc_mpi(ZePeer *peer,
                              metadata_tag,
                              MPI_COMM_WORLD,
                              MPI_STATUS_IGNORE);
+  ze_peer_mpi_debug_log(mpi_rank,
+                        "metadata exchange end: ret=%d remote_dma_fd=%d "
+                        "remote_device_id=0x%x remote_pfn_nents=%d",
+                        mpi_ret,
+                        recv_data.dma_buf_fd,
+                        recv_data.device_id,
+                        recv_data.pfn_list.nents);
   if (mpi_ret != MPI_SUCCESS) {
     close(vmem_fd);
     mpi_abort_with_message("MPI_Sendrecv failed while exchanging IPC metadata");
@@ -201,8 +276,18 @@ void exchange_ipc_mpi(ZePeer *peer,
   int open_ioctl_ret = 0;
   {
     std::lock_guard<std::mutex> lock(vmem_ioctl_mutex);
+    ze_peer_mpi_debug_log(mpi_rank,
+                          "ioctl GET_IPC_HANDLE begin: remote_device_id=0x%x "
+                          "remote_pfn_nents=%d",
+                          remote_data.device_id,
+                          remote_data.pfn_list.nents);
     open_ioctl_ret = ioctl(vmem_fd, ZE_PEER_VMEM_IOCTL_GET_IPC_HANDLE,
                            &remote_data);
+    ze_peer_mpi_debug_log(mpi_rank,
+                          "ioctl GET_IPC_HANDLE end: ret=%d errno=%d new_fd=%d",
+                          open_ioctl_ret,
+                          errno,
+                          remote_data.fd);
   }
   if (open_ioctl_ret != 0) {
     const int open_errno = errno;
@@ -221,9 +306,16 @@ void exchange_ipc_mpi(ZePeer *peer,
 
   {
     std::lock_guard<std::mutex> lock(ze_ipc_api_mutex);
+    ze_peer_mpi_debug_log(mpi_rank,
+                          "memoryOpenIpcHandle begin: local_device=%u",
+                          local_device_id);
     peer->benchmark->memoryOpenIpcHandle(local_device_id,
                                          remote_handle,
                                          remote_ipc_buffer);
+    ze_peer_mpi_debug_log(mpi_rank,
+                          "memoryOpenIpcHandle end: local_device=%u remote_ptr=%p",
+                          local_device_id,
+                          *remote_ipc_buffer);
   }
 
   close(remote_dma_buf_fd);
@@ -358,6 +450,13 @@ void ZePeer::bandwidth_latency_ipc(peer_test_t test_type,
     int mpi_size = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+    ze_peer_mpi_debug_log(mpi_rank,
+                          "ipc_mpi entry: mpi_size=%d local_device=%u "
+                          "remote_device=%u tag_base=%d",
+                          mpi_size,
+                          local_device_id,
+                          remote_device_id,
+                          mpi_msg_tag_base);
     if (mpi_size != 2) {
       mpi_abort_with_message("MPI mode requires exactly 2 ranks");
     }
@@ -414,12 +513,24 @@ void ZePeer::bandwidth_latency_ipc(peer_test_t test_type,
     }
 
     if (transfer_type == PEER_READ) {
+      ze_peer_mpi_debug_log(mpi_rank,
+                            "perform_copy begin (READ): local_device=%u "
+                            "remote_device=%u size=%zu",
+                            local_device_id,
+                            remote_device_id,
+                            buffer_size);
       perform_copy(test_type,
                    command_list,
                    command_queue,
                    ze_buffers[local_device_id],
                    remote_ipc_buffer,
                    buffer_size);
+      ze_peer_mpi_debug_log(mpi_rank,
+                            "perform_copy end (READ): local_device=%u "
+                            "remote_device=%u size=%zu",
+                            local_device_id,
+                            remote_device_id,
+                            buffer_size);
 
       if (validate_results) {
         validate_buffer(command_list,
@@ -430,18 +541,36 @@ void ZePeer::bandwidth_latency_ipc(peer_test_t test_type,
                         buffer_size);
       }
     } else {
+      ze_peer_mpi_debug_log(mpi_rank,
+                            "perform_copy begin (WRITE): local_device=%u "
+                            "remote_device=%u size=%zu",
+                            local_device_id,
+                            remote_device_id,
+                            buffer_size);
       perform_copy(test_type,
                    command_list,
                    command_queue,
                    remote_ipc_buffer,
                    ze_buffers[local_device_id],
                    buffer_size);
+      ze_peer_mpi_debug_log(mpi_rank,
+                            "perform_copy end (WRITE): local_device=%u "
+                            "remote_device=%u size=%zu",
+                            local_device_id,
+                            remote_device_id,
+                            buffer_size);
     }
   }
 
   if (use_mpi_remote_exchange) {
 #if ZE_PEER_ENABLE_MPI
+    ze_peer_mpi_debug_log(mpi_rank,
+                "copy_done sync start: tag=%d",
+                mpi_msg_tag_base + mpi_copy_done_tag_offset);
     mpi_pair_sync_or_abort(mpi_rank, mpi_msg_tag_base + mpi_copy_done_tag_offset);
+    ze_peer_mpi_debug_log(mpi_rank,
+                "copy_done sync end: tag=%d",
+                mpi_msg_tag_base + mpi_copy_done_tag_offset);
 #endif
   } else if (is_server) {
     int child_status = 0;
@@ -464,7 +593,13 @@ void ZePeer::bandwidth_latency_ipc(peer_test_t test_type,
 
   if (use_mpi_remote_exchange) {
 #if ZE_PEER_ENABLE_MPI
+    ze_peer_mpi_debug_log(mpi_rank,
+                          "cleanup sync start: tag=%d",
+                          mpi_msg_tag_base + mpi_cleanup_tag_offset);
     mpi_pair_sync_or_abort(mpi_rank, mpi_msg_tag_base + mpi_cleanup_tag_offset);
+    ze_peer_mpi_debug_log(mpi_rank,
+                          "cleanup sync end: tag=%d",
+                          mpi_msg_tag_base + mpi_cleanup_tag_offset);
 #endif
   }
 

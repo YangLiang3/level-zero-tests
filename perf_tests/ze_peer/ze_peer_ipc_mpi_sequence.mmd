@@ -1,0 +1,57 @@
+sequenceDiagram
+    autonumber
+    participant T0 as Rank0 PairThread
+    participant V0 as /dev/vmem (Rank0)
+    participant M as MPI
+    participant V1 as /dev/vmem (Rank1)
+    participant T1 as Rank1 PairThread
+
+    Note over T0,T1: One device pair in --ipc-mpi mode (pair_tag_base + {0,1,2})
+
+    rect rgb(235, 245, 255)
+        Note over T0,T1: Phase A: Local metadata collection
+        T0->>V0: open("/dev/vmem")
+        T1->>V1: open("/dev/vmem")
+        T0->>T0: zeMemGetIpcHandle(local_buffer)
+        T1->>T1: zeMemGetIpcHandle(local_buffer)
+        T0->>V0: IOCTL_GET_PFN_LIST(local_handle)
+        T1->>V1: IOCTL_GET_PFN_LIST(local_handle)
+        Note over T0,T1: EBADF retry up to 3 attempts
+    end
+
+    rect rgb(245, 255, 235)
+        Note over T0,T1: Phase B: Metadata exchange and remote open
+        T0->>M: MPI_Sendrecv(metadata_tag)
+        T1->>M: MPI_Sendrecv(metadata_tag)
+        M-->>T0: peer metadata
+        M-->>T1: peer metadata
+        T0->>V0: IOCTL_GET_IPC_HANDLE(peer_pfn_list)
+        T1->>V1: IOCTL_GET_IPC_HANDLE(peer_pfn_list)
+        T0->>T0: zeMemOpenIpcHandle(remote_dma_buf_fd)
+        T1->>T1: zeMemOpenIpcHandle(remote_dma_buf_fd)
+    end
+
+    rect rgb(255, 245, 235)
+        Note over T0,T1: Phase C: Copy execution
+        alt unidirectional (default)
+            T1->>T1: perform_copy(...)
+            T0->>T0: no copy (metadata/sync only)
+        else bidirectional (-b)
+            T0->>T0: perform_copy(...)
+            T1->>T1: perform_copy(...)
+        end
+    end
+
+    rect rgb(245, 245, 255)
+        Note over T0,T1: Phase D: Pair synchronization and cleanup
+        T0->>M: MPI_Sendrecv(copy_done_tag)
+        T1->>M: MPI_Sendrecv(copy_done_tag)
+        T0->>T0: zeMemCloseIpcHandle(remote)
+        T1->>T1: zeMemCloseIpcHandle(remote)
+        T0->>M: MPI_Sendrecv(cleanup_tag)
+        T1->>M: MPI_Sendrecv(cleanup_tag)
+        T0->>V0: close(vmem_fd)
+        T1->>V1: close(vmem_fd)
+    end
+
+    Note over T0,T1: Multiple pairs run concurrently only when MPI_THREAD_MULTIPLE is available
