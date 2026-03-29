@@ -66,6 +66,9 @@ struct vmem_open_handle_data {
   ze_ipc_mem_handle_t ipc_handle;
   int rank;
   int device_id;
+  uint32_t bus;
+  uint32_t device;
+  uint32_t function;
   struct vmem_pfn_list pfn_list;
   int fd;
 };
@@ -86,6 +89,32 @@ int get_device_id(ze_device_handle_t device) {
   ze_device_properties_t props = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
   SUCCESS_OR_TERMINATE(zeDeviceGetProperties(device, &props));
   return static_cast<int>(props.deviceId);
+}
+
+bool get_device_bdf(ze_device_handle_t device,
+                    uint32_t *bus,
+                    uint32_t *dev,
+                    uint32_t *func) {
+  if (bus == nullptr || dev == nullptr || func == nullptr) {
+    return false;
+  }
+
+  *bus = 0;
+  *dev = 0;
+  *func = 0;
+
+#if defined(ZE_STRUCTURE_TYPE_PCI_EXT_PROPERTIES)
+  ze_pci_ext_properties_t pci_props = {};
+  pci_props.stype = ZE_STRUCTURE_TYPE_PCI_EXT_PROPERTIES;
+  if (zeDevicePciGetPropertiesExt(device, &pci_props) == ZE_RESULT_SUCCESS) {
+    *bus = pci_props.address.bus;
+    *dev = pci_props.address.device;
+    *func = pci_props.address.function;
+    return true;
+  }
+#endif
+
+  return false;
 }
 
 #if ZE_PEER_ENABLE_MPI
@@ -175,16 +204,23 @@ void exchange_ipc_mpi(ZePeer *peer,
       local_data.rank = mpi_rank;
       local_data.device_id =
           get_device_id(peer->benchmark->_devices[local_device_id]);
+      get_device_bdf(peer->benchmark->_devices[local_device_id],
+                     &local_data.bus,
+                     &local_data.device,
+                     &local_data.function);
       local_data.fd = local_dma_buf_fd;
 
       {
         std::lock_guard<std::mutex> ioctl_lock(vmem_ioctl_mutex);
         ze_peer_mpi_debug_log(mpi_rank,
                               "ioctl GET_PFN_LIST begin: attempt=%d rank=%d "
-                              "device_id=0x%x dma_fd=%d",
+                              "device_id=0x%x bdf=%02x:%02x.%x dma_fd=%d",
                               attempt,
                               local_data.rank,
                               local_data.device_id,
+                              local_data.bus,
+                              local_data.device,
+                              local_data.function,
                               local_data.fd);
         ioctl_ret =
             ioctl(vmem_fd, ZE_PEER_VMEM_IOCTL_GET_PFN_LIST, &local_data);
