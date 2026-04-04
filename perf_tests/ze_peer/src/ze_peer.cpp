@@ -172,19 +172,16 @@ void run_ipc_test(int size_to_run, uint32_t remote_device_id,
     }
 
     // --ipc-mpi semantic:
-    //   -s local_device_id  = source GPU index for the pair
-    //   -d remote_device_id = destination GPU index for the pair
-    // Source/destination meaning is driven by -s/-d values, not fixed rank
-    // numbers. Unidirectional executes on source side; with -b both sides
-    // execute for each configured pair.
+    //   rank 0 (first host) uses -s local_device_id as its local GPU index
+    //   rank 1 (second host) uses -d remote_device_id as its local GPU index
+    // Unidirectional executes on source side (-s). With -b both sides execute
+    // for each configured pair.
     const uint32_t current_rank_device_id =
-        (mpi_rank == 0) ? remote_device_id : local_device_id;
+      (mpi_rank == 0) ? local_device_id : remote_device_id;
     const uint32_t peer_rank_device_id =
-        (mpi_rank == 0) ? local_device_id : remote_device_id;
+      (mpi_rank == 0) ? remote_device_id : local_device_id;
 
-    // In the current 2-rank mapping, the side represented by pair.first (-s)
-    // is the source execution side.
-    const bool is_source_side = (mpi_rank != 0);
+    const bool is_source_side = (mpi_rank == 0);
     const bool execute_copy_on_this_rank = ZePeer::bidirectional || is_source_side;
 
     // In cross-node mode each rank should only validate and allocate on its
