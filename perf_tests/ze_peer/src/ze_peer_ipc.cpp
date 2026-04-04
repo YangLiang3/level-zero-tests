@@ -17,6 +17,10 @@
 
 #include <level_zero/zes_api.h>
 
+#ifndef ZES_STRUCTURE_TYPE_PCI_PROPERTIES
+#define ZES_STRUCTURE_TYPE_PCI_PROPERTIES static_cast<zes_structure_type_t>(0x2)
+#endif
+
 #if ZE_PEER_ENABLE_MPI
 #include <dlfcn.h>
 #include <mpi.h>
