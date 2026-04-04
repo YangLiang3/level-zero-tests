@@ -13,9 +13,10 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <fcntl.h>
 #include <mutex>
-#include <sys/ioctl.h>
+
+#include "vmem_lib.h"
+#include <level_zero/zes_api.h>
 
 #if ZE_PEER_ENABLE_MPI
 #include <mpi.h>
@@ -23,7 +24,6 @@
 
 namespace {
 
-constexpr const char *vmem_dev_path = "/dev/vmem";
 constexpr int mpi_metadata_tag_offset = 0;
 constexpr int mpi_copy_done_tag_offset = 1;
 constexpr int mpi_cleanup_tag_offset = 2;
@@ -56,41 +56,10 @@ void ze_peer_mpi_debug_log(int rank, const char *fmt, ...) {
   std::fflush(stderr);
 }
 
-struct vmem_pfn_list {
-  int nents;
-  unsigned long long addrs[8];
-  size_t size[8];
-};
-
-struct vmem_open_handle_data {
-  ze_ipc_mem_handle_t ipc_handle;
-  int rank;
-  int device_id;
-  uint32_t domain;
-  uint32_t bus;
-  uint32_t device;
-  uint32_t function;
-  struct vmem_pfn_list pfn_list;
-  int fd;
-};
-
 struct mpi_exchange_data {
-  int rank;
-  int device_id;
   int dma_buf_fd;
-  struct vmem_pfn_list pfn_list;
+  struct pfn_list pfn_list;
 };
-
-#define ZE_PEER_VMEM_IOCTL_GET_PFN_LIST                                       \
-  _IOWR('v', 0, struct vmem_open_handle_data)
-#define ZE_PEER_VMEM_IOCTL_GET_IPC_HANDLE                                     \
-  _IOWR('v', 1, struct vmem_open_handle_data)
-
-int get_device_id(ze_device_handle_t device) {
-  ze_device_properties_t props = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
-  SUCCESS_OR_TERMINATE(zeDeviceGetProperties(device, &props));
-  return static_cast<int>(props.deviceId);
-}
 
 bool get_device_dbdf(ze_device_handle_t device,
                      uint32_t *domain,
@@ -115,6 +84,21 @@ bool get_device_dbdf(ze_device_handle_t device,
     *dev = pci_props.address.device;
     *func = pci_props.address.function;
     return true;
+  }
+#endif
+
+#if defined(ZES_STRUCTURE_TYPE_PCI_PROPERTIES)
+  {
+    zes_pci_properties_t sysman_pci_props = {};
+    sysman_pci_props.stype = ZES_STRUCTURE_TYPE_PCI_PROPERTIES;
+    if (zesDevicePciGetProperties(reinterpret_cast<zes_device_handle_t>(device),
+                                  &sysman_pci_props) == ZE_RESULT_SUCCESS) {
+      *domain = sysman_pci_props.address.domain;
+      *bus = sysman_pci_props.address.bus;
+      *dev = sysman_pci_props.address.device;
+      *func = sysman_pci_props.address.function;
+      return true;
+    }
   }
 #endif
 
@@ -172,25 +156,37 @@ void exchange_ipc_mpi(ZePeer *peer,
                       int mpi_rank,
                       void **remote_ipc_buffer,
                       int metadata_tag) {
-  int vmem_fd = open(vmem_dev_path, O_RDWR);
+  int vmem_fd = vmem_open();
   ze_peer_mpi_debug_log(mpi_rank,
-                        "open %s => fd=%d local_device=%u metadata_tag=%d",
-                        vmem_dev_path,
+                        "vmem_open => fd=%d local_device=%u metadata_tag=%d",
                         vmem_fd,
                         local_device_id,
                         metadata_tag);
   if (vmem_fd < 0) {
-    mpi_abort_with_message(std::string("Failed to open ") + vmem_dev_path +
-                           ": " + strerror(errno));
+    mpi_abort_with_message(std::string("Failed to open /dev/vmem: ") +
+                           strerror(errno));
   }
 
   ze_ipc_mem_handle_t local_handle{};
   int local_dma_buf_fd = -1;
-  vmem_open_handle_data local_data{};
+  struct pfn_list local_pfn_list{};
+  uint32_t local_domain = 0;
+  uint32_t local_bus = 0;
+  uint32_t local_device = 0;
+  uint32_t local_function = 0;
   bool pfn_ready = false;
 
+  if (!get_device_dbdf(peer->benchmark->_devices[local_device_id],
+                       &local_domain,
+                       &local_bus,
+                       &local_device,
+                       &local_function)) {
+    vmem_close(vmem_fd);
+    mpi_abort_with_message("Failed to query PCI DBDF from Level Zero");
+  }
+
   for (int attempt = 0; attempt < mpi_get_pfn_retry_count; attempt++) {
-    int ioctl_ret = 0;
+    int open_ret = 0;
     {
       // Serialize handle export + PFN query to avoid cross-thread fd races.
       std::lock_guard<std::mutex> export_lock(mpi_get_pfn_mutex);
@@ -202,44 +198,27 @@ void exchange_ipc_mpi(ZePeer *peer,
       }
 
       memcpy(&local_dma_buf_fd, &local_handle, sizeof(local_dma_buf_fd));
-
-      local_data = {};
-      local_data.ipc_handle = local_handle;
-      local_data.rank = mpi_rank;
-      local_data.device_id =
-          get_device_id(peer->benchmark->_devices[local_device_id]);
-      if (!get_device_dbdf(peer->benchmark->_devices[local_device_id],
-                           &local_data.domain,
-                           &local_data.bus,
-                           &local_data.device,
-                           &local_data.function)) {
-        close(vmem_fd);
-        mpi_abort_with_message("Failed to query PCI DBDF from Level Zero");
-      }
-      local_data.fd = local_dma_buf_fd;
+      local_pfn_list = {};
 
       {
         std::lock_guard<std::mutex> ioctl_lock(vmem_ioctl_mutex);
+        vmem_init(local_domain, local_bus, local_device, local_function);
         ze_peer_mpi_debug_log(mpi_rank,
-                              "ioctl GET_PFN_LIST begin: attempt=%d rank=%d "
-                              "device_id=0x%x dbdf=%04x:%02x:%02x.%x dma_fd=%d",
+                              "vmem_open_handle begin: attempt=%d dbdf=%04x:%02x:%02x.%x dma_fd=%d",
                               attempt,
-                              local_data.rank,
-                              local_data.device_id,
-                              local_data.domain,
-                              local_data.bus,
-                              local_data.device,
-                              local_data.function,
-                              local_data.fd);
-        ioctl_ret =
-            ioctl(vmem_fd, ZE_PEER_VMEM_IOCTL_GET_PFN_LIST, &local_data);
+                              local_domain,
+                              local_bus,
+                              local_device,
+                              local_function,
+                              local_dma_buf_fd);
+        open_ret = vmem_open_handle(vmem_fd, &local_handle, &local_pfn_list);
         ze_peer_mpi_debug_log(mpi_rank,
-                              "ioctl GET_PFN_LIST end: attempt=%d ret=%d "
+                              "vmem_open_handle end: attempt=%d ret=%d "
                               "errno=%d nents=%d",
                               attempt,
-                              ioctl_ret,
+                              open_ret,
                               errno,
-                              local_data.pfn_list.nents);
+                              local_pfn_list.nents);
       }
 
       {
@@ -248,9 +227,9 @@ void exchange_ipc_mpi(ZePeer *peer,
       }
     }
 
-    if (ioctl_ret == 0) {
-      if (local_data.pfn_list.nents <= 0) {
-        close(vmem_fd);
+    if (open_ret == 0) {
+      if (local_pfn_list.nents <= 0) {
+        vmem_close(vmem_fd);
         mpi_abort_with_message("Local PFN list is empty");
       }
       pfn_ready = true;
@@ -262,31 +241,27 @@ void exchange_ipc_mpi(ZePeer *peer,
       continue;
     }
 
-    close(vmem_fd);
-    mpi_abort_with_message(std::string("VMEM_IOCTL_GET_PFN_LIST failed: ") +
+    vmem_close(vmem_fd);
+    mpi_abort_with_message(std::string("vmem_open_handle failed: ") +
                            strerror(ioctl_errno));
   }
 
   if (!pfn_ready) {
-    close(vmem_fd);
-    mpi_abort_with_message("VMEM_IOCTL_GET_PFN_LIST failed after retries");
+    vmem_close(vmem_fd);
+    mpi_abort_with_message("vmem_open_handle failed after retries");
   }
 
   mpi_exchange_data send_data{};
-  send_data.rank = mpi_rank;
-  send_data.device_id = local_data.device_id;
   send_data.dma_buf_fd = local_dma_buf_fd;
-  memcpy(&send_data.pfn_list, &local_data.pfn_list, sizeof(send_data.pfn_list));
+  memcpy(&send_data.pfn_list, &local_pfn_list, sizeof(send_data.pfn_list));
 
   mpi_exchange_data recv_data{};
   int peer_rank = 1 - mpi_rank;
   ze_peer_mpi_debug_log(mpi_rank,
-                        "metadata exchange begin: peer_rank=%d tag=%d "
-                        "local_dma_fd=%d local_device_id=0x%x pfn_nents=%d",
+                        "metadata exchange begin: peer_rank=%d tag=%d local_dma_fd=%d pfn_nents=%d",
                         peer_rank,
                         metadata_tag,
                         send_data.dma_buf_fd,
-                        send_data.device_id,
                         send_data.pfn_list.nents);
   int mpi_ret = MPI_Sendrecv(&send_data,
                              sizeof(send_data),
@@ -301,50 +276,42 @@ void exchange_ipc_mpi(ZePeer *peer,
                              MPI_COMM_WORLD,
                              MPI_STATUS_IGNORE);
   ze_peer_mpi_debug_log(mpi_rank,
-                        "metadata exchange end: ret=%d remote_dma_fd=%d "
-                        "remote_device_id=0x%x remote_pfn_nents=%d",
+                        "metadata exchange end: ret=%d remote_dma_fd=%d remote_pfn_nents=%d",
                         mpi_ret,
                         recv_data.dma_buf_fd,
-                        recv_data.device_id,
                         recv_data.pfn_list.nents);
   if (mpi_ret != MPI_SUCCESS) {
-    close(vmem_fd);
+    vmem_close(vmem_fd);
     mpi_abort_with_message("MPI_Sendrecv failed while exchanging IPC metadata");
   }
 
-  vmem_open_handle_data remote_data{};
-  remote_data.rank = mpi_rank;
-  remote_data.device_id = recv_data.device_id;
-  memcpy(&remote_data.pfn_list, &recv_data.pfn_list,
-         sizeof(remote_data.pfn_list));
+  struct pfn_list remote_pfn_list{};
+  int remote_dma_buf_fd = -1;
+  memcpy(&remote_pfn_list, &recv_data.pfn_list, sizeof(remote_pfn_list));
 
-  int open_ioctl_ret = 0;
+  int import_ret = 0;
   {
     std::lock_guard<std::mutex> lock(vmem_ioctl_mutex);
     ze_peer_mpi_debug_log(mpi_rank,
-                          "ioctl GET_IPC_HANDLE begin: remote_device_id=0x%x "
-                          "remote_pfn_nents=%d",
-                          remote_data.device_id,
-                          remote_data.pfn_list.nents);
-    open_ioctl_ret = ioctl(vmem_fd, ZE_PEER_VMEM_IOCTL_GET_IPC_HANDLE,
-                           &remote_data);
+                          "vmem_get_handle begin: remote_pfn_nents=%d",
+                          remote_pfn_list.nents);
+    import_ret = vmem_get_handle(vmem_fd, &remote_dma_buf_fd, &remote_pfn_list);
     ze_peer_mpi_debug_log(mpi_rank,
-                          "ioctl GET_IPC_HANDLE end: ret=%d errno=%d new_fd=%d",
-                          open_ioctl_ret,
+                          "vmem_get_handle end: ret=%d errno=%d new_fd=%d",
+                          import_ret,
                           errno,
-                          remote_data.fd);
+                          remote_dma_buf_fd);
   }
-  if (open_ioctl_ret != 0) {
+  if (import_ret != 0) {
     const int open_errno = errno;
-    close(vmem_fd);
-    mpi_abort_with_message(std::string("VMEM_IOCTL_GET_IPC_HANDLE failed: ") +
+    vmem_close(vmem_fd);
+    mpi_abort_with_message(std::string("vmem_get_handle failed: ") +
                            strerror(open_errno));
   }
 
-  int remote_dma_buf_fd = remote_data.fd;
   if (remote_dma_buf_fd < 0) {
-    close(vmem_fd);
-    mpi_abort_with_message("VMEM_IOCTL_GET_IPC_HANDLE returned invalid dma-buf fd");
+    vmem_close(vmem_fd);
+    mpi_abort_with_message("vmem_get_handle returned invalid dma-buf fd");
   }
   ze_ipc_mem_handle_t remote_handle{};
   memcpy(&remote_handle, &remote_dma_buf_fd, sizeof(remote_dma_buf_fd));
@@ -365,7 +332,7 @@ void exchange_ipc_mpi(ZePeer *peer,
 
   close(remote_dma_buf_fd);
 
-  close(vmem_fd);
+  vmem_close(vmem_fd);
 }
 #endif
 
