@@ -435,7 +435,7 @@ void exchange_ipc_mpi(ZePeer *peer,
                           errno,
                           remote_dma_buf_fd);
   }
-  if (import_ret != 0) {
+  if (import_ret < 0) {
     const int open_errno = errno;
     vmem_api.close_fn(vmem_fd);
     mpi_abort_with_message(std::string("vmem_get_handle failed: ") +
