@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 if(UNIX)
-    set(OS_SPECIFIC_LIBS pthread rt)
+    set(OS_SPECIFIC_LIBS pthread rt dl)
   find_package(MPI QUIET COMPONENTS CXX)
   if(MPI_CXX_FOUND)
     list(APPEND OS_SPECIFIC_LIBS MPI::MPI_CXX)
@@ -24,15 +24,11 @@ add_lzt_test(
     src/ze_peer_parallel_pair_targets.cpp
     src/ze_peer_parallel_single_target.cpp
     src/ze_peer_common.cpp
-    ../../../vmem_test/lib/vmem_lib.c
   LINK_LIBRARIES ${OS_SPECIFIC_LIBS}
   KERNELS ze_peer_benchmarks
 )
 
   if(TARGET ze_peer)
-    target_include_directories(ze_peer PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/../../../vmem_test/lib
-      ${CMAKE_CURRENT_SOURCE_DIR}/../../../vmem_test/driver)
     if(MPI_CXX_FOUND)
       target_compile_definitions(ze_peer PRIVATE ZE_PEER_ENABLE_MPI=1)
     else()

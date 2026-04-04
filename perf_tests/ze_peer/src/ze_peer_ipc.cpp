@@ -15,11 +15,12 @@
 #include <cstdlib>
 #include <mutex>
 
-#include "vmem_lib.h"
 #include <level_zero/zes_api.h>
 
 #if ZE_PEER_ENABLE_MPI
+#include <dlfcn.h>
 #include <mpi.h>
+#include <vmem_test/vmem_lib.h>
 #endif
 
 namespace {
@@ -56,10 +57,86 @@ void ze_peer_mpi_debug_log(int rank, const char *fmt, ...) {
   std::fflush(stderr);
 }
 
+#if ZE_PEER_ENABLE_MPI
 struct mpi_exchange_data {
   int dma_buf_fd;
   struct pfn_list pfn_list;
 };
+
+struct vmem_runtime_api {
+  void *lib_handle;
+  int (*open_fn)();
+  int (*close_fn)(int);
+  int (*init_fn)(uint32_t, uint32_t, uint32_t, uint32_t);
+  int (*open_handle_fn)(int, ze_ipc_mem_handle_t *, struct pfn_list *);
+  int (*get_handle_fn)(int, int *, struct pfn_list *);
+  bool loaded;
+  std::string load_error;
+};
+
+vmem_runtime_api &get_vmem_runtime_api() {
+  static vmem_runtime_api api = {};
+  static std::once_flag once;
+
+  std::call_once(once, [&]() {
+    const char *env_path = std::getenv("ZE_PEER_VMEM_LIB_PATH");
+    const char *candidates[] = {
+        env_path,
+        "libvmem.so",
+        "libvmem_lib.so",
+    };
+
+    auto load_symbol = [](void *handle, const char *name) -> void * {
+      dlerror();
+      void *sym = dlsym(handle, name);
+      return (dlerror() == nullptr) ? sym : nullptr;
+    };
+
+    for (const char *candidate : candidates) {
+      if (candidate == nullptr || candidate[0] == '\0') {
+        continue;
+      }
+
+      void *handle = dlopen(candidate, RTLD_NOW | RTLD_LOCAL);
+      if (handle == nullptr) {
+        api.load_error = dlerror() ? dlerror() : "unknown dlopen error";
+        continue;
+      }
+
+      api.open_fn = reinterpret_cast<int (*)()>(load_symbol(handle, "vmem_open"));
+      api.close_fn = reinterpret_cast<int (*)(int)>(load_symbol(handle, "vmem_close"));
+      api.init_fn = reinterpret_cast<int (*)(uint32_t, uint32_t, uint32_t, uint32_t)>(
+          load_symbol(handle, "vmem_init"));
+      api.open_handle_fn = reinterpret_cast<int (*)(int, ze_ipc_mem_handle_t *, struct pfn_list *)>(
+          load_symbol(handle, "vmem_open_handle"));
+      api.get_handle_fn = reinterpret_cast<int (*)(int, int *, struct pfn_list *)>(
+          load_symbol(handle, "vmem_get_handle"));
+
+      if (api.open_fn != nullptr && api.close_fn != nullptr && api.init_fn != nullptr &&
+          api.open_handle_fn != nullptr && api.get_handle_fn != nullptr) {
+        api.lib_handle = handle;
+        api.loaded = true;
+        api.load_error.clear();
+        return;
+      }
+
+      dlclose(handle);
+      api.open_fn = nullptr;
+      api.close_fn = nullptr;
+      api.init_fn = nullptr;
+      api.open_handle_fn = nullptr;
+      api.get_handle_fn = nullptr;
+      api.load_error = "vmem symbols missing in " + std::string(candidate);
+    }
+
+    if (api.load_error.empty()) {
+      api.load_error = "no usable vmem shared library found";
+    }
+  });
+
+  return api;
+}
+#endif
 
 bool get_device_dbdf(ze_device_handle_t device,
                      uint32_t *domain,
@@ -156,7 +233,12 @@ void exchange_ipc_mpi(ZePeer *peer,
                       int mpi_rank,
                       void **remote_ipc_buffer,
                       int metadata_tag) {
-  int vmem_fd = vmem_open();
+  vmem_runtime_api &vmem_api = get_vmem_runtime_api();
+  if (!vmem_api.loaded) {
+    mpi_abort_with_message("Failed to load vmem runtime API: " + vmem_api.load_error);
+  }
+
+  int vmem_fd = vmem_api.open_fn();
   ze_peer_mpi_debug_log(mpi_rank,
                         "vmem_open => fd=%d local_device=%u metadata_tag=%d",
                         vmem_fd,
@@ -181,7 +263,7 @@ void exchange_ipc_mpi(ZePeer *peer,
                        &local_bus,
                        &local_device,
                        &local_function)) {
-    vmem_close(vmem_fd);
+    vmem_api.close_fn(vmem_fd);
     mpi_abort_with_message("Failed to query PCI DBDF from Level Zero");
   }
 
@@ -202,7 +284,7 @@ void exchange_ipc_mpi(ZePeer *peer,
 
       {
         std::lock_guard<std::mutex> ioctl_lock(vmem_ioctl_mutex);
-        vmem_init(local_domain, local_bus, local_device, local_function);
+        vmem_api.init_fn(local_domain, local_bus, local_device, local_function);
         ze_peer_mpi_debug_log(mpi_rank,
                               "vmem_open_handle begin: attempt=%d dbdf=%04x:%02x:%02x.%x dma_fd=%d",
                               attempt,
@@ -211,7 +293,7 @@ void exchange_ipc_mpi(ZePeer *peer,
                               local_device,
                               local_function,
                               local_dma_buf_fd);
-        open_ret = vmem_open_handle(vmem_fd, &local_handle, &local_pfn_list);
+        open_ret = vmem_api.open_handle_fn(vmem_fd, &local_handle, &local_pfn_list);
         ze_peer_mpi_debug_log(mpi_rank,
                               "vmem_open_handle end: attempt=%d ret=%d "
                               "errno=%d nents=%d",
@@ -229,7 +311,7 @@ void exchange_ipc_mpi(ZePeer *peer,
 
     if (open_ret == 0) {
       if (local_pfn_list.nents <= 0) {
-        vmem_close(vmem_fd);
+        vmem_api.close_fn(vmem_fd);
         mpi_abort_with_message("Local PFN list is empty");
       }
       pfn_ready = true;
@@ -241,13 +323,13 @@ void exchange_ipc_mpi(ZePeer *peer,
       continue;
     }
 
-    vmem_close(vmem_fd);
+    vmem_api.close_fn(vmem_fd);
     mpi_abort_with_message(std::string("vmem_open_handle failed: ") +
                            strerror(ioctl_errno));
   }
 
   if (!pfn_ready) {
-    vmem_close(vmem_fd);
+    vmem_api.close_fn(vmem_fd);
     mpi_abort_with_message("vmem_open_handle failed after retries");
   }
 
@@ -295,7 +377,7 @@ void exchange_ipc_mpi(ZePeer *peer,
     ze_peer_mpi_debug_log(mpi_rank,
                           "vmem_get_handle begin: remote_pfn_nents=%d",
                           remote_pfn_list.nents);
-    import_ret = vmem_get_handle(vmem_fd, &remote_dma_buf_fd, &remote_pfn_list);
+    import_ret = vmem_api.get_handle_fn(vmem_fd, &remote_dma_buf_fd, &remote_pfn_list);
     ze_peer_mpi_debug_log(mpi_rank,
                           "vmem_get_handle end: ret=%d errno=%d new_fd=%d",
                           import_ret,
@@ -304,13 +386,13 @@ void exchange_ipc_mpi(ZePeer *peer,
   }
   if (import_ret != 0) {
     const int open_errno = errno;
-    vmem_close(vmem_fd);
+    vmem_api.close_fn(vmem_fd);
     mpi_abort_with_message(std::string("vmem_get_handle failed: ") +
                            strerror(open_errno));
   }
 
   if (remote_dma_buf_fd < 0) {
-    vmem_close(vmem_fd);
+    vmem_api.close_fn(vmem_fd);
     mpi_abort_with_message("vmem_get_handle returned invalid dma-buf fd");
   }
   ze_ipc_mem_handle_t remote_handle{};
@@ -332,7 +414,7 @@ void exchange_ipc_mpi(ZePeer *peer,
 
   close(remote_dma_buf_fd);
 
-  vmem_close(vmem_fd);
+  vmem_api.close_fn(vmem_fd);
 }
 #endif
 
