@@ -363,7 +363,7 @@ void exchange_ipc_mpi(ZePeer *peer,
                         recv_data.dma_buf_fd,
                         recv_data.pfn_list.nents);
   if (mpi_ret != MPI_SUCCESS) {
-    vmem_close(vmem_fd);
+    vmem_api.close_fn(vmem_fd);
     mpi_abort_with_message("MPI_Sendrecv failed while exchanging IPC metadata");
   }
 
