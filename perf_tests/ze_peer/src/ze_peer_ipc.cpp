@@ -15,11 +15,7 @@
 #include <cstdlib>
 #include <mutex>
 
-#include <level_zero/zes_api.h>
-
-#ifndef ZES_STRUCTURE_TYPE_PCI_PROPERTIES
-#define ZES_STRUCTURE_TYPE_PCI_PROPERTIES static_cast<zes_structure_type_t>(0x2)
-#endif
+#include <level_zero/ze_api.h>
 
 #if ZE_PEER_ENABLE_MPI
 #include <dlfcn.h>
@@ -165,45 +161,6 @@ bool get_device_dbdf(ze_device_handle_t device,
            dbdf_function == 0;
   };
 
-#if defined(ZES_STRUCTURE_TYPE_PCI_PROPERTIES)
-  static std::once_flag zes_init_once;
-  static ze_result_t zes_init_result = ZE_RESULT_SUCCESS;
-  std::call_once(zes_init_once, []() { zes_init_result = zesInit(0); });
-
-  if (zes_init_result != ZE_RESULT_SUCCESS) {
-    std::fprintf(stderr,
-                 "[ZE_PEER_MPI] get_device_dbdf: zesInit ret=%d, fall back to zeDevicePciGetPropertiesExt\n",
-                 static_cast<int>(zes_init_result));
-  } else {
-  zes_pci_properties_t sysman_pci_props = {};
-  sysman_pci_props.stype = ZES_STRUCTURE_TYPE_PCI_PROPERTIES;
-  const ze_result_t pci_ret =
-      zesDevicePciGetProperties(reinterpret_cast<zes_device_handle_t>(device),
-                                &sysman_pci_props);
-    if (pci_ret == ZE_RESULT_SUCCESS) {
-      *domain = sysman_pci_props.address.domain;
-      *bus = sysman_pci_props.address.bus;
-      *dev = sysman_pci_props.address.device;
-      *func = sysman_pci_props.address.function;
-
-      if (!is_zero_dbdf(*domain, *bus, *dev, *func)) {
-        return true;
-      }
-
-      std::fprintf(stderr,
-                   "[ZE_PEER_MPI] get_device_dbdf: zesDevicePciGetProperties returned DBDF 0000:00:00.0, fall back to zeDevicePciGetPropertiesExt\n");
-    } else {
-      std::fprintf(stderr,
-                   "[ZE_PEER_MPI] get_device_dbdf: zesDevicePciGetProperties ret=%d, fall back to zeDevicePciGetPropertiesExt\n",
-                   static_cast<int>(pci_ret));
-    }
-  }
-#else
-  std::fprintf(stderr,
-               "[ZE_PEER_MPI] get_device_dbdf: ZES_STRUCTURE_TYPE_PCI_PROPERTIES is not available, fall back to zeDevicePciGetPropertiesExt\n");
-#endif
-
-#if defined(ZE_STRUCTURE_TYPE_PCI_EXT_PROPERTIES)
   ze_pci_ext_properties_t pci_props = {};
   pci_props.stype = ZE_STRUCTURE_TYPE_PCI_EXT_PROPERTIES;
   const ze_result_t pci_ext_ret = zeDevicePciGetPropertiesExt(device, &pci_props);
@@ -226,11 +183,6 @@ bool get_device_dbdf(ze_device_handle_t device,
   }
 
   return true;
-#else
-  std::fprintf(stderr,
-               "[ZE_PEER_MPI] get_device_dbdf failed: zeDevicePciGetPropertiesExt is not available\n");
-  return false;
-#endif
 }
 
 #if ZE_PEER_ENABLE_MPI
