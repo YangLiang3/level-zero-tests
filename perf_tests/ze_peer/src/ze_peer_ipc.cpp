@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <sys/stat.h>
 
 #include <level_zero/ze_api.h>
 
@@ -75,12 +76,47 @@ struct vmem_runtime_api {
   std::string load_error;
 };
 
+static void vmem_trace(const char *fmt, ...) {
+  std::fprintf(stderr, "[ZE_PEER_VMEM][pid=%d] ", static_cast<int>(getpid()));
+  va_list ap;
+  va_start(ap, fmt);
+  std::vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  std::fprintf(stderr, "\n");
+  std::fflush(stderr);
+}
+
 vmem_runtime_api &get_vmem_runtime_api() {
+  vmem_trace("get_vmem_runtime_api: entered");
   static vmem_runtime_api api = {};
+  vmem_trace("get_vmem_runtime_api: static api object constructed");
   static std::once_flag once;
+  vmem_trace("get_vmem_runtime_api: before call_once");
 
   std::call_once(once, [&]() {
-    const char *env_path = std::getenv("ZE_PEER_VMEM_LIB_PATH");
+    vmem_trace("get_vmem_runtime_api: lambda entered");
+
+    // ---- environment snapshot ----
+    const char *env_path     = std::getenv("ZE_PEER_VMEM_LIB_PATH");
+    const char *env_ldpath   = std::getenv("LD_LIBRARY_PATH");
+    const char *env_ldpre    = std::getenv("LD_PRELOAD");
+    vmem_trace("env: ZE_PEER_VMEM_LIB_PATH=%s",  env_path   ? env_path   : "<not set>");
+    vmem_trace("env: LD_LIBRARY_PATH=%s",         env_ldpath ? env_ldpath : "<not set>");
+    vmem_trace("env: LD_PRELOAD=%s",              env_ldpre  ? env_ldpre  : "<not set>");
+
+    // ---- /dev/vmem existence ----
+    {
+      int dev_ok = access("/dev/vmem", F_OK);
+      struct stat dev_st = {};
+      int stat_ret = stat("/dev/vmem", &dev_st);
+      vmem_trace("/dev/vmem access=%d (0=ok) stat=%d mode=0%o",
+                 dev_ok, stat_ret, stat_ret == 0 ? dev_st.st_mode : 0u);
+    }
+
+    // ---- struct size sanity ----
+    vmem_trace("sizeof(pfn_list)=%zu sizeof(mpi_exchange_data)=%zu",
+               sizeof(struct pfn_list), sizeof(mpi_exchange_data));
+
     const char *candidates[] = {
         env_path,
         "libvmem.so",
@@ -90,20 +126,37 @@ vmem_runtime_api &get_vmem_runtime_api() {
     auto load_symbol = [](void *handle, const char *name) -> void * {
       dlerror();
       void *sym = dlsym(handle, name);
-      return (dlerror() == nullptr) ? sym : nullptr;
+      const char *err = dlerror();
+      vmem_trace("  dlsym('%s') => %p%s%s",
+                 name, sym,
+                 err ? " err: " : "",
+                 err ? err : "");
+      return (err == nullptr) ? sym : nullptr;
     };
 
     for (const char *candidate : candidates) {
       if (candidate == nullptr || candidate[0] == '\0') {
+        vmem_trace("get_vmem_runtime_api: skipping null/empty candidate");
         continue;
       }
 
+      {
+        int lib_ok = access(candidate, F_OK);
+        int lib_rx = access(candidate, R_OK | X_OK);
+        vmem_trace("candidate '%s': access F_OK=%d R|X=%d", candidate, lib_ok, lib_rx);
+      }
+      vmem_trace("get_vmem_runtime_api: trying dlopen('%s')", candidate);
       void *handle = dlopen(candidate, RTLD_NOW | RTLD_LOCAL);
       if (handle == nullptr) {
-        api.load_error = dlerror() ? dlerror() : "unknown dlopen error";
+        const char *dl_err = dlerror();
+        vmem_trace("get_vmem_runtime_api: dlopen('%s') failed: %s",
+                   candidate, dl_err ? dl_err : "unknown error");
+        api.load_error = dl_err ? dl_err : "unknown dlopen error";
         continue;
       }
+      vmem_trace("get_vmem_runtime_api: dlopen('%s') => handle=%p", candidate, handle);
 
+      vmem_trace("get_vmem_runtime_api: resolving symbols from '%s'", candidate);
       api.open_fn = reinterpret_cast<int (*)()>(load_symbol(handle, "vmem_open"));
       api.close_fn = reinterpret_cast<int (*)(int)>(load_symbol(handle, "vmem_close"));
       api.init_fn = reinterpret_cast<int (*)(uint32_t, uint32_t, uint32_t, uint32_t)>(
@@ -112,6 +165,7 @@ vmem_runtime_api &get_vmem_runtime_api() {
           load_symbol(handle, "vmem_open_handle"));
       api.get_handle_fn = reinterpret_cast<int (*)(int, int *, struct pfn_list *)>(
           load_symbol(handle, "vmem_get_handle"));
+      vmem_trace("get_vmem_runtime_api: symbol resolution done for '%s'", candidate);
 
       if (api.open_fn != nullptr && api.close_fn != nullptr && api.init_fn != nullptr &&
           api.open_handle_fn != nullptr && api.get_handle_fn != nullptr) {
@@ -119,9 +173,12 @@ vmem_runtime_api &get_vmem_runtime_api() {
         api.loaded = true;
         api.loaded_candidate = candidate;
         api.load_error.clear();
+        vmem_trace("get_vmem_runtime_api: all symbols resolved, api ready (candidate='%s')",
+                   candidate);
         return;
       }
 
+      vmem_trace("get_vmem_runtime_api: incomplete symbols in '%s', closing", candidate);
       dlclose(handle);
       api.open_fn = nullptr;
       api.close_fn = nullptr;
@@ -134,8 +191,12 @@ vmem_runtime_api &get_vmem_runtime_api() {
     if (api.load_error.empty()) {
       api.load_error = "no usable vmem shared library found";
     }
+    vmem_trace("get_vmem_runtime_api: lambda done, loaded=%d error='%s'",
+               api.loaded ? 1 : 0,
+               api.load_error.c_str());
   });
 
+  vmem_trace("get_vmem_runtime_api: returning, loaded=%d", api.loaded ? 1 : 0);
   return api;
 }
 #endif
@@ -264,6 +325,7 @@ void exchange_ipc_mpi(ZePeer *peer,
                         peer->ze_buffers.size(),
                         peer->ze_buffers[local_device_id]);
 
+  ze_peer_mpi_debug_log(mpi_rank, "calling get_vmem_runtime_api");
   vmem_runtime_api &vmem_api = get_vmem_runtime_api();
   ze_peer_mpi_debug_log(mpi_rank,
                         "vmem runtime resolved: loaded=%d candidate=%s lib_handle=%p open_fn=%p close_fn=%p init_fn=%p open_handle_fn=%p get_handle_fn=%p error=%s",
@@ -627,12 +689,29 @@ void ZePeer::bandwidth_latency_ipc(peer_test_t test_type,
                           remote_device_id,
                           ze_buffers[local_device_id]);
 
+    // Install a SIGSEGV handler so a crash inside dlopen/vmem_open prints
+    // a message before dying, rather than silently killing the process.
+    struct sigaction sa_crash = {};
+    sa_crash.sa_flags = SA_RESETHAND;
+    sa_crash.sa_handler = [](int sig) {
+      const char msg[] = "[ZE_PEER_MPI] SIGSEGV caught during exchange_ipc_mpi setup\n";
+      (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+      // Re-raise so the default handler generates a core dump.
+      raise(sig);
+    };
+    struct sigaction sa_old = {};
+    sigaction(SIGSEGV, &sa_crash, &sa_old);
+    ze_peer_mpi_debug_log(mpi_rank, "SIGSEGV handler installed before exchange_ipc_mpi");
+
     exchange_ipc_mpi(this,
                      local_device_id,
                      mpi_rank,
                      &remote_ipc_buffer,
                      mpi_msg_tag_base + mpi_metadata_tag_offset);
 
+    // Restore previous SIGSEGV handler now that the risky section is done.
+    sigaction(SIGSEGV, &sa_old, nullptr);
+    ze_peer_mpi_debug_log(mpi_rank, "SIGSEGV handler restored after exchange_ipc_mpi");
     ze_peer_mpi_debug_log(mpi_rank,
                           "exchange IPC metadata finished: remote_ipc_buffer=%p",
                           remote_ipc_buffer);
