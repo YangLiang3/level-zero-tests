@@ -71,6 +71,7 @@ struct vmem_runtime_api {
   int (*open_handle_fn)(int, ze_ipc_mem_handle_t *, struct pfn_list *);
   int (*get_handle_fn)(int, int *, struct pfn_list *);
   bool loaded;
+  std::string loaded_candidate;
   std::string load_error;
 };
 
@@ -116,6 +117,7 @@ vmem_runtime_api &get_vmem_runtime_api() {
           api.open_handle_fn != nullptr && api.get_handle_fn != nullptr) {
         api.lib_handle = handle;
         api.loaded = true;
+        api.loaded_candidate = candidate;
         api.load_error.clear();
         return;
       }
@@ -236,10 +238,58 @@ void exchange_ipc_mpi(ZePeer *peer,
                       int mpi_rank,
                       void **remote_ipc_buffer,
                       int metadata_tag) {
+  ze_peer_mpi_debug_log(mpi_rank,
+                        "exchange_ipc_mpi enter: peer=%p benchmark=%p local_device=%u metadata_tag=%d remote_ipc_buffer_ptr=%p",
+                        peer,
+                        (peer != nullptr) ? peer->benchmark : nullptr,
+                        local_device_id,
+                        metadata_tag,
+                        remote_ipc_buffer);
+
+  if (peer == nullptr || peer->benchmark == nullptr) {
+    mpi_abort_with_message("Invalid ZePeer benchmark context in MPI IPC exchange");
+  }
+
+  if (local_device_id >= peer->benchmark->_devices.size()) {
+    mpi_abort_with_message("Local device index out of range in MPI IPC exchange");
+  }
+
+  if (local_device_id >= peer->ze_buffers.size()) {
+    mpi_abort_with_message("Local device buffer index out of range in MPI IPC exchange");
+  }
+
+  ze_peer_mpi_debug_log(mpi_rank,
+                        "exchange_ipc_mpi context: devices=%zu ze_buffers=%zu local_ze_buffer=%p",
+                        peer->benchmark->_devices.size(),
+                        peer->ze_buffers.size(),
+                        peer->ze_buffers[local_device_id]);
+
   vmem_runtime_api &vmem_api = get_vmem_runtime_api();
+  ze_peer_mpi_debug_log(mpi_rank,
+                        "vmem runtime resolved: loaded=%d candidate=%s lib_handle=%p open_fn=%p close_fn=%p init_fn=%p open_handle_fn=%p get_handle_fn=%p error=%s",
+                        vmem_api.loaded ? 1 : 0,
+                        vmem_api.loaded_candidate.empty() ? "<none>" : vmem_api.loaded_candidate.c_str(),
+                        vmem_api.lib_handle,
+                        reinterpret_cast<void *>(vmem_api.open_fn),
+                        reinterpret_cast<void *>(vmem_api.close_fn),
+                        reinterpret_cast<void *>(vmem_api.init_fn),
+                        reinterpret_cast<void *>(vmem_api.open_handle_fn),
+                        reinterpret_cast<void *>(vmem_api.get_handle_fn),
+                        vmem_api.load_error.empty() ? "<none>" : vmem_api.load_error.c_str());
+
   if (!vmem_api.loaded) {
     mpi_abort_with_message("Failed to load vmem runtime API: " + vmem_api.load_error);
   }
+
+  if (vmem_api.open_fn == nullptr || vmem_api.close_fn == nullptr ||
+      vmem_api.init_fn == nullptr || vmem_api.open_handle_fn == nullptr ||
+      vmem_api.get_handle_fn == nullptr) {
+    mpi_abort_with_message("vmem runtime API is marked loaded but has null function pointers");
+  }
+
+  ze_peer_mpi_debug_log(mpi_rank,
+                        "about to call vmem_open: open_fn=%p",
+                        reinterpret_cast<void *>(vmem_api.open_fn));
 
   int vmem_fd = vmem_api.open_fn();
   ze_peer_mpi_debug_log(mpi_rank,
@@ -485,6 +535,18 @@ void ZePeer::set_up_ipc(size_t number_buffer_elements,
                         size_t &buffer_size,
                         ze_command_queue_handle_t &command_queue,
                         ze_command_list_handle_t &command_list) {
+  if (device_id >= ze_peer_devices.size() || device_id >= ze_buffers.size()) {
+    std::cerr << "ERROR: IPC local device index out of range: " << device_id
+              << ", available devices: " << ze_peer_devices.size() << "\n";
+    std::terminate();
+  }
+
+  if (ze_peer_devices[device_id].engines.empty()) {
+    std::cerr << "ERROR: No command queue/list engines available for device "
+              << device_id << "\n";
+    std::terminate();
+  }
+
   size_t element_size = sizeof(char);
   buffer_size = element_size * number_buffer_elements;
 
@@ -558,11 +620,22 @@ void ZePeer::bandwidth_latency_ipc(peer_test_t test_type,
       mpi_abort_with_message("MPI mode requires exactly 2 ranks");
     }
 
+    ze_peer_mpi_debug_log(mpi_rank,
+                          "about to exchange IPC metadata: this=%p local_device=%u remote_device=%u local_ze_buffer=%p",
+                          this,
+                          local_device_id,
+                          remote_device_id,
+                          ze_buffers[local_device_id]);
+
     exchange_ipc_mpi(this,
                      local_device_id,
                      mpi_rank,
                      &remote_ipc_buffer,
                      mpi_msg_tag_base + mpi_metadata_tag_offset);
+
+    ze_peer_mpi_debug_log(mpi_rank,
+                          "exchange IPC metadata finished: remote_ipc_buffer=%p",
+                          remote_ipc_buffer);
 #else
     std::cerr << "MPI support is not available in this build\n";
     std::terminate();
